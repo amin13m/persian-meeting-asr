@@ -1,5 +1,23 @@
+# ============================================================
+# Whisper Persian V4
+# ============================================================
+#
+# Torch / CUDA is managed separately.
+# Existing environment:
+#
+# torch       2.12.1+cu126
+# torchaudio  2.11.0+cu126
+# torchvision 0.27.1+cu126
+#
+# Do NOT reinstall the Torch stack unnecessarily.
+# ============================================================
+
+
 transformers==4.52.4
-accelerate
-safetensors
-soundfile
-librosa
+accelerate==1.15.0
+safetensors==0.8.0
+
+librosa==0.11.0
+soundfile==0.14.0
+
+PyYAML==6.0.3
