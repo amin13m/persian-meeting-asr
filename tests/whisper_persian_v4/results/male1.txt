@@ -1,0 +1,36 @@
+======================================================================
+Whisper Persian V4 - Inference Test Result
+======================================================================
+
+AUDIO
+----------------------------------------------------------------------
+File: male1.wav
+Path: D:\Projects\persian_asr\tests\samples\male1.wav
+Duration: 67.640 sec
+Duration formatted: 00:01:07.640
+Sample rate: 16000 Hz
+
+MODEL
+----------------------------------------------------------------------
+Model path: D:\Projects\persian_asr\models\whisper_persian_v4
+Model: nezamisafa/whisper-persian-v4
+Base model: openai/whisper-large-v3
+
+HARDWARE
+----------------------------------------------------------------------
+Device: cuda:0
+GPU: NVIDIA GeForce RTX 3060 Laptop GPU
+Dtype: torch.float16
+
+PERFORMANCE
+----------------------------------------------------------------------
+Inference time: 5.140 sec
+RTF: 0.0760
+Peak VRAM: 3.146 GB
+Realtime factor: 13.16x realtime
+
+TRANSCRIPTION
+----------------------------------------------------------------------
+سلام به همه و به دوره نتورک سکیوریتی خوش آمدید. امروز یاد می‌گیریم که چطور با استفاده از nmap یک شبکه را اسکن کنیم. قبل از شروع، ترمینال خود را باز کنید. دستور زیر را دقیقاً همان‌طور که نشان داده شده وارد کنید. nmap فاصله 10 sv فاصله 192.168.1.1
+
+======================================================================
