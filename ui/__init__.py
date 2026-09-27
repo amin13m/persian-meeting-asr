@@ -1,3 +1,1 @@
-"""
-Persian ASR User Interface.
-"""
+"""Persian ASR PySide6 UI."""

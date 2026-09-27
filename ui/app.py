@@ -1,131 +1,127 @@
+
 from __future__ import annotations
 
-import json
 import logging
-import math
-import os
 import queue
-import re
 import sys
-import threading
-import time
-import tkinter as tk
-
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from tkinter import font as tkfont
 
 import yaml
 
-# ============================================================
-# UI Module Imports
-# Supports:
-#     python ui/app.py
-# and:
-#     python -m ui.app
-# ============================================================
+from PySide6.QtCore import QObject, Signal, QTimer , Qt
+from PySide6.QtWidgets import QApplication, QMainWindow
+
+
+
 
 try:
-    # Package execution:
-    # python -m ui.app
-    from .ui_appearance import UIAppearanceMixin
     from .ui_constants import (
         CONFIG_PATH,
-        DEFAULT_INPUT_DIR,
-        DEFAULT_OUTPUT_DIR,
-        ENGINE_REGISTRY,
         PROJECT_ROOT,
-        RECORDINGS_DIR,
-        TEXTS,
-        THEMES,
-        format_seconds,
-        is_persian_language,
     )
-    from .ui_components import RoundedButton
+    from .ui_settings import UISettings
     from .ui_layout import UILayoutMixin
+    from .ui_appearance import UIAppearanceMixin
     from .ui_operations import UIOperationsMixin
+    from .logger import UILogHandler
 
 except ImportError:
-    # Direct execution:
-    # python ui/app.py
-
     UI_DIR = Path(__file__).resolve().parent
 
-    if str(UI_DIR) not in sys.path:
-        sys.path.insert(0, str(UI_DIR))
+    if str(UI_DIR.parent) not in sys.path:
+        sys.path.insert(0, str(UI_DIR.parent))
 
-    PROJECT_DIR = UI_DIR.parent
-
-    if str(PROJECT_DIR) not in sys.path:
-        sys.path.insert(0, str(PROJECT_DIR))
-
-    from ui_appearance import UIAppearanceMixin
-    from ui_constants import (
+    from ui.ui_constants import (
         CONFIG_PATH,
-        DEFAULT_INPUT_DIR,
-        DEFAULT_OUTPUT_DIR,
-        ENGINE_REGISTRY,
         PROJECT_ROOT,
-        RECORDINGS_DIR,
-        TEXTS,
-        THEMES,
-        format_seconds,
-        is_persian_language,
     )
-    from ui_components import RoundedButton
-    from ui_layout import UILayoutMixin
-    from ui_operations import UIOperationsMixin
+    from ui.ui_settings import UISettings
+    from ui.ui_layout import UILayoutMixin
+    from ui.ui_appearance import UIAppearanceMixin
+    from ui.ui_operations import UIOperationsMixin
+    from ui.logger import UILogHandler
 
 
-# Project modules
-from engines.audio_chunker import AudioChunker
-from ui.logger import UILogHandler
+class UIBridge(QObject):
+    signal = Signal(object)
 
-
-# ============================================================
-# Main Application
-# ============================================================
 
 class PersianASRApp(
+    QMainWindow,
     UILayoutMixin,
     UIAppearanceMixin,
     UIOperationsMixin,
 ):
-    def __init__(self, root: tk.Tk):
-
-        self.root = root
+    def __init__(self):
+        super().__init__()
 
         # ----------------------------------------------------
-        # State
+        # Qt Application
         # ----------------------------------------------------
+        self.app = QApplication.instance()
 
-        self.language = "fa"
-        self.theme_name = "dark"
+        if self.app is None:
+            raise RuntimeError(
+                "QApplication instance is not available."
+            )
 
+        # ----------------------------------------------------
+        # Settings
+        # ----------------------------------------------------
+        self.settings = UISettings()
+
+        self.language = self.settings.data.get(
+            "language",
+            "fa",
+        )
+
+        self.theme_name = self.settings.data.get(
+            "theme",
+            "dark",
+        )
+
+
+
+        # ----------------------------------------------------
+        # Runtime state
+        # ----------------------------------------------------
         self.model_loaded = False
         self.processing = False
         self.recording = False
 
-        self.current_audio: Path | None = None
-        self.current_result: dict | None = None
+        self.current_audio = None
+        self.current_result = None
 
         self.engine = None
         self.chunker = None
         self.recorder = None
-
         self.operation = None
+
+        self.model_var = "whisper_persian_v4"
+        self.audio_var = ""
+
+        self.status_key = "ready"
+        self.status_detail = ""
 
         # ----------------------------------------------------
         # Logging
         # ----------------------------------------------------
-
         self.log_queue = queue.Queue()
+
+        self.ui_bridge = UIBridge()
+
+        self.ui_bridge.signal.connect(
+            self._execute_ui_callback,
+            Qt.QueuedConnection,
+        )
 
         self.logger = logging.getLogger(
             "PersianASR.UI"
         )
 
-        self.logger.setLevel(logging.DEBUG)
+        self.logger.setLevel(
+            logging.DEBUG
+        )
 
         self.ui_log_handler = UILogHandler(
             self.log_queue
@@ -135,26 +131,17 @@ class PersianASRApp(
             logging.DEBUG
         )
 
-        formatter = logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(message)s",
-            datefmt="%H:%M:%S",
-        )
-
         self.ui_log_handler.setFormatter(
-            formatter
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(message)s",
+                datefmt="%H:%M:%S",
+            )
         )
 
-        # Remove old UI handlers.
-        for handler in list(
-            self.logger.handlers
-        ):
-            if isinstance(
-                handler,
-                UILogHandler,
-            ):
-                self.logger.removeHandler(
-                    handler
-                )
+        # Remove previous UI handlers only.
+        for handler in list(self.logger.handlers):
+            if isinstance(handler, UILogHandler):
+                self.logger.removeHandler(handler)
 
         self.logger.addHandler(
             self.ui_log_handler
@@ -163,164 +150,118 @@ class PersianASRApp(
         self.logger.propagate = False
 
         # ----------------------------------------------------
-        # Root logging
-        #
-        # This is important:
-        # Engine / AudioChunker logs also appear in Logs tab.
+        # Root logger → UI
         # ----------------------------------------------------
+        root_logger = logging.getLogger()
 
-        self.root_logger = logging.getLogger()
-
-        self.root_logger.setLevel(
+        root_logger.setLevel(
             logging.INFO
         )
 
-        already_attached = False
-
-        for handler in self.root_logger.handlers:
-            if isinstance(
-                handler,
-                UILogHandler,
-            ):
-                already_attached = True
-                break
-
-        if not already_attached:
-            self.root_ui_log_handler = UILogHandler(
-                self.log_queue
-            )
-
-            self.root_ui_log_handler.setLevel(
-                logging.INFO
-            )
-
-            self.root_ui_log_handler.setFormatter(
-                formatter
-            )
-
-            self.root_logger.addHandler(
-                self.root_ui_log_handler
-            )
-
-        # ----------------------------------------------------
-        # Variables
-        # ----------------------------------------------------
-
-        self.model_var = tk.StringVar(
-            value="whisper_persian_v4"
+        self.root_ui_log_handler = UILogHandler(
+            self.log_queue
         )
 
-        self.audio_var = tk.StringVar(
-            value=""
+        self.root_ui_log_handler.setLevel(
+            logging.INFO
         )
 
-        self.status_var = tk.StringVar(
-            value=""
+        self.root_ui_log_handler.setFormatter(
+            self.ui_log_handler.formatter
         )
 
-        self.operation_var = tk.StringVar(
-            value=""
+        root_logger.addHandler(
+            self.root_ui_log_handler
         )
-
-        self.progress_text_var = tk.StringVar(
-            value=""
-        )
-
-        self.language_var = tk.StringVar(
-            value="فارسی"
-        )
-
-        self.theme_var = tk.StringVar(
-            value="تیره"
-        )
-
-        self.progress_var = tk.DoubleVar(
-            value=0
-        )
-
-        # ----------------------------------------------------
-        # Fonts
-        # ----------------------------------------------------
-
-        self._setup_fonts()
 
         # ----------------------------------------------------
         # Window
         # ----------------------------------------------------
-
-        self.root.title(
-            TEXTS[self.language]["app_title"]
+        self.setMinimumSize(
+            1000,
+            720,
         )
 
-        self.root.geometry(
-            "1180x820"
-        )
-
-        self.root.minsize(
-            980,
-            700,
-        )
-
-        self.root.protocol(
-            "WM_DELETE_WINDOW",
-            self.on_close,
+        self.resize(
+            1220,
+            860,
         )
 
         # ----------------------------------------------------
-        # Style
+        # Build UI
         # ----------------------------------------------------
-
-        self.style = ttk.Style(
-            self.root
-        )
-
-        try:
-            self.style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        # ----------------------------------------------------
-        # Spinner
-        # ----------------------------------------------------
-
-        self.spinner_running = False
-        self.spinner_angle = 0
-
-        # ----------------------------------------------------
-        # Build
-        # ----------------------------------------------------
-
         self.build_ui()
 
         self.apply_theme()
+
         self.update_language()
+
         self.apply_direction()
 
         # ----------------------------------------------------
-        # Log queue
+        # Restore last tab
         # ----------------------------------------------------
+        try:
+            last_tab = int(
+                self.settings.data.get(
+                    "last_tab",
+                    0,
+                )
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            last_tab = 0
 
-        self.root.after(
-            80,
-            self.process_log_queue,
+        if hasattr(self, "tabs"):
+            self.tabs.setCurrentIndex(
+                max(
+                    0,
+                    last_tab,
+                )
+            )
+
+        # ----------------------------------------------------
+        # UI timer
+        # ----------------------------------------------------
+        self.timer = QTimer(self)
+
+        self.timer.timeout.connect(
+            self.process_log_queue
         )
 
-        # ----------------------------------------------------
-        # Startup
-        # ----------------------------------------------------
+        self.timer.start(80)
 
-        self.logger.info("=" * 60)
-        self.logger.info("Persian ASR UI started")
+        # ----------------------------------------------------
+        # Startup logs
+        # ----------------------------------------------------
+        self.logger.info(
+            "=" * 60
+        )
+
+        self.logger.info(
+            "Persian ASR PySide6 UI started"
+        )
+
         self.logger.info(
             "Project root: %s",
             PROJECT_ROOT,
         )
+
         self.logger.info(
             "Configuration: %s",
             CONFIG_PATH,
         )
 
+        # ----------------------------------------------------
+        # Initial control state
+        # ----------------------------------------------------
         self.refresh_controls()
+
+    # ========================================================
+    # Configuration
+    # ========================================================
 
     def load_config(self):
         if not CONFIG_PATH.exists():
@@ -328,11 +269,11 @@ class PersianASRApp(
                 f"Configuration file not found: {CONFIG_PATH}"
             )
 
-        with CONFIG_PATH.open(
-            "r",
-            encoding="utf-8",
-        ) as f:
-            config = yaml.safe_load(f)
+        config = yaml.safe_load(
+            CONFIG_PATH.read_text(
+                encoding="utf-8"
+            )
+        )
 
         if not isinstance(config, dict):
             raise ValueError(
@@ -340,19 +281,35 @@ class PersianASRApp(
             )
 
         return config
+    
+    
+    
+    
 
-    def get_input_dir(self, config):
-        path = (
-            config.get(
-                "audio",
-                {},
-            ).get(
+    # ========================================================
+    # Directories
+    # ========================================================
+
+    def get_input_dir(
+        self,
+        config,
+    ):
+        value = (
+            config
+            .get("audio", {})
+            .get(
                 "input_dir",
                 "input",
             )
         )
 
-        result = PROJECT_ROOT / path
+        path = Path(value)
+
+        if path.is_absolute():
+            result = path
+        else:
+            result = PROJECT_ROOT / path
+
         result.mkdir(
             parents=True,
             exist_ok=True,
@@ -360,96 +317,82 @@ class PersianASRApp(
 
         return result
 
-    def get_output_dir(self, config):
-        path = (
-            config.get(
-                "audio",
-                {},
-            ).get(
+    def get_output_dir(
+        self,
+        config,
+    ):
+        value = (
+            config
+            .get("audio", {})
+            .get(
                 "output_dir",
                 "output",
             )
         )
 
-        result = PROJECT_ROOT / path
+        path = Path(value)
+
+        if path.is_absolute():
+            result = path
+        else:
+            result = PROJECT_ROOT / path
+
         result.mkdir(
             parents=True,
             exist_ok=True,
         )
 
         return result
+
+    # ========================================================
+    # First show
+    # ========================================================
+
+    def showEvent(
+        self,
+        event,
+    ):
+        super().showEvent(event)
+
+        if hasattr(
+            self,
+            "main_page",
+        ) and hasattr(
+            self.main_page,
+            "transcription_text",
+        ):
+            self.main_page.transcription_text.set_text(
+                self.TEXT["no_transcription"],
+                self.language == "fa",
+            )
+            
+            
+    def _execute_ui_callback(self, callback):
+        try:
+            callback()
+        except Exception:
+            self.logger.exception(
+                "UI callback failed."
+            )
+
 
 # ============================================================
 # Main
 # ============================================================
 
 def main():
+    app = QApplication.instance()
 
-    root = tk.Tk()
+    if app is None:
+        app = QApplication(sys.argv)
 
-    app = PersianASRApp(
-        root
-    )
+    window = PersianASRApp()
 
-    # --------------------------------------------------------
-    # Cursor
-    # --------------------------------------------------------
+    window.show()
 
-    button_widgets = [
-        app.load_button,
-        app.unload_button,
-        app.select_audio_button,
-        app.start_record_button,
-        app.stop_record_button,
-        app.transcribe_button,
-        app.export_txt_button,
-        app.export_json_button,
-        app.open_output_button,
-        app.clear_logs_button,
-        app.copy_text_button,
-    ]
+    return app.exec()
 
-    for button in button_widgets:
-        app.setup_button_cursor(
-            button
-        )
-
-    app.setup_cursor(
-        app.language_combo,
-        "hand2",
-    )
-
-    app.setup_cursor(
-        app.theme_combo,
-        "hand2",
-    )
-
-    app.setup_cursor(
-        app.model_combo,
-        "hand2",
-    )
-
-    app.setup_cursor(
-        app.audio_entry,
-        "arrow",
-    )
-
-    app.setup_cursor(
-        app.transcription_text,
-        "xterm",
-    )
-
-    app.setup_cursor(
-        app.logs_text,
-        "xterm",
-    )
-
-    root.mainloop()
-
-
-# ============================================================
-# Entry Point
-# ============================================================
 
 if __name__ == "__main__":
     main()
+

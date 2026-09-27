@@ -1,20 +1,22 @@
+
 from __future__ import annotations
 
 import json
 import logging
-import math
 import os
-import queue
-import re
 import sys
-import threading
 import time
-import tkinter as tk
+import threading
+
 from pathlib import Path
-from tkinter import filedialog, messagebox
+
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QMessageBox,
+)
 
 from engines.audio_chunker import AudioChunker
-from ui.logger import UILogHandler
 from ui.recorder import AudioRecorder
 
 from .ui_constants import (
@@ -30,105 +32,240 @@ from .ui_constants import (
 
 
 class UIOperationsMixin:
-    def load_model(self):
 
-        if (
-            self.processing
-            or self.recording
-        ):
+    # ========================================================
+    # UI thread bridge
+    # ========================================================
+
+    def ui_call(self, fn):
+        """
+        Schedule a callable on the Qt UI thread.
+
+        Worker threads must never directly modify Qt widgets.
+        """
+
+        if not hasattr(self, "ui_bridge"):
             return
 
-        model_name = (
-            self.model_var.get().strip()
-        )
+        self.ui_bridge.signal.emit(fn)
+
+
+    # ========================================================
+    # Model loading
+    # ========================================================
+
+    def load_model(self):
+        if self.processing or self.recording:
+            return
+
+        model_name = self.model_var.strip()
 
         if not model_name:
-
-            messagebox.showwarning(
-                TEXTS[self.language]["warning"],
-                TEXTS[self.language]["select_model"],
+            return QMessageBox.warning(
+                self,
+                self.TEXT["warning"],
+                self.TEXT["select_model"],
             )
 
-            return
-
-        engine_class = ENGINE_REGISTRY.get(
-            model_name
-        )
+        engine_class = ENGINE_REGISTRY.get(model_name)
 
         if engine_class is None:
+            self.logger.error(
+                "MODEL | unknown model: %s",
+                model_name,
+            )
 
-            messagebox.showerror(
-                TEXTS[self.language]["error"],
+            return QMessageBox.critical(
+                self,
+                self.TEXT["error"],
                 f"Unknown model: {model_name}",
             )
 
-            return
+        # ----------------------------------------------------
+        # Processing state
+        # ----------------------------------------------------
 
         self.processing = True
         self.operation = "loading"
 
-        self.set_status(
-            "loading"
-        )
-
-        self.progress_var.set(0)
-        self.progress_text_var.set("")
-
-        self.refresh_controls()
-
         self.logger.info(
-            "Selected engine: %s",
+            "MODEL | loading started | model=%s",
             model_name,
         )
 
-        thread = threading.Thread(
-            target=self._load_model_worker,
-            args=(
-                model_name,
-                engine_class,
-            ),
-            daemon=True,
-        )
+        # ----------------------------------------------------
+        # MainPage processing UI
+        # ----------------------------------------------------
 
-        thread.start()
+        try:
+            self.main_page.set_processing_running(
+                "در حال بارگذاری مدل...",
+                indeterminate=True,
+            )
+        except Exception:
+            # Compatibility with older MainPage
+            self.set_status("loading")
+            self.set_progress(0, "")
+
+        self.refresh_controls()
+
+        # ----------------------------------------------------
+        # Start worker
+        # ----------------------------------------------------
+
+        threading.Thread(
+            target=self._load_model_worker,
+            args=(model_name, engine_class),
+            daemon=True,
+        ).start()
+
 
     def _load_model_worker(
         self,
         model_name,
         engine_class,
     ):
-
         engine = None
 
         try:
+            self.logger.info(
+                "MODEL | preparing configuration"
+            )
 
             config = self.load_config()
 
-            model_config = config.get(
-                "model",
-                {},
+            configured = (
+                config
+                .get("engine", {})
+                .get("name")
             )
 
-            configured_model_name = config.get(
-                "engine",
-                {},
-            ).get(
-                "name"
+            self.logger.info(
+                "MODEL | configured engine=%s | selected=%s",
+                configured,
+                model_name,
             )
 
-            if configured_model_name:
-                if configured_model_name != model_name:
-                    raise ValueError(
-                        "Selected model does not match "
-                        "engine.name in config.yaml."
-                    )
+            if configured and configured != model_name:
+                raise ValueError(
+                    "Selected model does not match "
+                    "engine.name in config.yaml."
+                )
 
             model_path = (
                 PROJECT_ROOT
-                / model_config.get(
-                    "path",
-                    "",
+                / config
+                .get("model", {})
+                .get("path", "")
+            )
+
+            self.logger.info(
+                "MODEL | model directory: %s",
+                model_path,
+            )
+
+            if not model_path.exists():
+                raise FileNotFoundError(
+                    f"Model directory not found: {model_path}"
                 )
+
+            self.logger.info(
+                "MODEL | initializing engine: %s",
+                engine_class.__name__,
+            )
+
+            started = time.perf_counter()
+
+            engine = engine_class(config)
+
+            self.logger.info(
+                "MODEL | calling engine.load()"
+            )
+
+            engine.load()
+
+            elapsed = (
+                time.perf_counter()
+                - started
+            )
+
+            self.logger.info(
+                "MODEL | engine.load() completed | "
+                "elapsed=%.3f sec",
+                elapsed,
+            )
+
+            self.engine = engine
+
+            self.logger.info(
+                "MODEL | initializing AudioChunker"
+            )
+
+            self.chunker = AudioChunker(config)
+
+            self.model_loaded = True
+
+            self.logger.info(
+                "MODEL | loading completed successfully | "
+                "model=%s | elapsed=%.3f sec",
+                model_name,
+                elapsed,
+            )
+
+            self.ui_call(
+                self._model_loaded_ui
+            )
+
+        except Exception:
+            if engine is not None:
+                try:
+                    engine.unload()
+                except Exception:
+                    pass
+
+            self.logger.exception(
+                "MODEL | loading failed | model=%s",
+                model_name,
+            )
+
+            self.ui_call(
+                self._model_load_failed_ui
+            )
+
+
+
+
+
+
+    
+
+    def _load_model_worker(
+        self,
+        model_name,
+        engine_class,
+    ):
+        engine = None
+
+        try:
+            config = self.load_config()
+
+            configured = (
+                config
+                .get("engine", {})
+                .get("name")
+            )
+
+            if configured and configured != model_name:
+                raise ValueError(
+                    "Selected model does not match "
+                    "engine.name in config.yaml."
+                )
+
+            model_path = (
+                PROJECT_ROOT
+                / config
+                .get("model", {})
+                .get("path", "")
             )
 
             self.logger.info(
@@ -141,43 +278,33 @@ class UIOperationsMixin:
                     f"Model directory not found: {model_path}"
                 )
 
-            load_start = time.perf_counter()
+            started = time.perf_counter()
 
-            engine = engine_class(
-                config
-            )
+            engine = engine_class(config)
 
-            self.logger.info(
-                "Loading engine..."
-            )
+            self.logger.info("Loading engine...")
 
             engine.load()
 
-            load_time = (
+            elapsed = (
                 time.perf_counter()
-                - load_start
-            )
-
-            chunker = AudioChunker(
-                config
+                - started
             )
 
             self.engine = engine
-            self.chunker = chunker
+
+            self.chunker = AudioChunker(config)
+
             self.model_loaded = True
 
             self.logger.info(
                 "Engine loaded successfully in %.3f sec.",
-                load_time,
+                elapsed,
             )
 
-            self.root.after(
-                0,
-                self._model_loaded_ui,
-            )
+            self.ui_call(self._model_loaded_ui)
 
         except Exception:
-
             if engine is not None:
                 try:
                     engine.unload()
@@ -188,82 +315,83 @@ class UIOperationsMixin:
                 "Model loading failed."
             )
 
-            self.root.after(
-                0,
-                self._model_load_failed_ui,
+            self.ui_call(
+                self._model_load_failed_ui
             )
 
     def _model_loaded_ui(self):
-
+        self.model_loaded = True
         self.processing = False
         self.operation = None
 
-        self.progress_var.set(100)
+        # توقف Spinner مدل
+        self.main_page.set_model_loading(False)
 
-        self.set_status(
-            "loaded"
+        # توقف قطعی Progress Animation
+        self.main_page.set_processing_success(
+            "مدل با موفقیت بارگذاری شد."
         )
 
         self.refresh_controls()
 
-    def _model_load_failed_ui(self):
+        self.logger.info(
+            "MODEL | UI updated | model_loaded=%s | current_audio=%s",
+            self.model_loaded,
+            self.current_audio,
+        )
 
+    def _model_load_failed_ui(self):
         self.processing = False
         self.operation = None
         self.model_loaded = False
-
         self.engine = None
         self.chunker = None
 
-        self.set_status(
-            "error"
+        self.main_page.set_model_loading(False)
+
+        self.main_page.set_processing_error(
+            "خطا در بارگذاری مدل."
         )
 
         self.refresh_controls()
 
-        messagebox.showerror(
-            TEXTS[self.language]["error"],
-            TEXTS[self.language]["model_load_failed"],
+        QMessageBox.critical(
+            self,
+            self.TEXT["error"],
+            self.TEXT["model_load_failed"],
         )
 
-    def unload_model(self):
+    # ========================================================
+    # Model unloading
+    # ========================================================
 
+    def unload_model(self):
         if (
             self.processing
             or self.recording
+            or not self.model_loaded
         ):
-            return
-
-        if not self.model_loaded:
             return
 
         self.processing = True
         self.operation = "unloading"
 
-        self.set_status(
-            "unloading"
-        )
-
-        self.progress_var.set(0)
-
+        self.set_status("unloading")
+        self.set_progress(0, "")
         self.refresh_controls()
 
         self.logger.info(
             "Unloading engine..."
         )
 
-        thread = threading.Thread(
+        threading.Thread(
             target=self._unload_model_worker,
             daemon=True,
-        )
-
-        thread.start()
+        ).start()
 
     def _unload_model_worker(self):
-
         try:
-
-            if self.engine is not None:
+            if self.engine:
                 self.engine.unload()
 
             self.engine = None
@@ -274,101 +402,96 @@ class UIOperationsMixin:
                 "Engine unloaded."
             )
 
-            self.root.after(
-                0,
-                self._model_unloaded_ui,
+            self.ui_call(
+                self._model_unloaded_ui
             )
 
         except Exception:
-
             self.logger.exception(
                 "Engine unload failed."
             )
 
-            self.root.after(
-                0,
-                self._model_unload_failed_ui,
+            self.ui_call(
+                self._model_unload_failed_ui
             )
 
     def _model_unloaded_ui(self):
-
         self.processing = False
         self.operation = None
 
-        self.set_status(
-            "unloaded"
-        )
-
+        self.set_status("unloaded")
         self.refresh_controls()
 
     def _model_unload_failed_ui(self):
-
         self.processing = False
         self.operation = None
 
-        self.set_status(
-            "error"
-        )
-
+        self.set_status("error")
         self.refresh_controls()
 
-    def select_audio(self):
+    # ========================================================
+    # Audio selection
+    # ========================================================
 
-        if (
-            self.processing
-            or self.recording
-        ):
+    def select_audio(self):
+        if self.processing or self.recording:
             return
 
         try:
-            config = self.load_config()
-            input_dir = self.get_input_dir(config)
+            input_dir = self.get_input_dir(
+                self.load_config()
+            )
         except Exception:
             input_dir = DEFAULT_INPUT_DIR
 
-        t = TEXTS[self.language]
+        text = self.TEXT
 
-        path = filedialog.askopenfilename(
-            title=t["open_audio"],
-            initialdir=str(input_dir),
-            filetypes=[
-                (
-                    t["audio_files"],
-                    "*.wav *.mp3 *.flac *.m4a *.ogg *.aac",
-                ),
-                (
-                    t["all_files"],
-                    "*.*",
-                ),
-            ],
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            text["open_audio"],
+            str(input_dir),
+            (
+                f"{text['audio_files']} "
+                "(*.wav *.mp3 *.flac *.m4a *.ogg *.aac);;"
+                f"{text['all_files']} (*.*)"
+            ),
         )
 
         if not path:
+            self.logger.info(
+                "Audio selection cancelled."
+            )
             return
 
-        self.current_audio = Path(path)
+        selected_path = Path(path)
 
-        self.audio_var.set(
-            str(self.current_audio)
-        )
+        if not selected_path.exists():
+            self.logger.error(
+                "Selected audio file does not exist: %s",
+                selected_path,
+            )
+
+            QMessageBox.warning(
+                self,
+                self.TEXT["warning"],
+                f"Audio file not found:\n{selected_path}",
+            )
+            return
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # current_audio belongs to the application state.
+        # The actual text widget belongs to MainPage.
+        # ----------------------------------------------------
+
+        self.current_audio = selected_path
+        self.audio_var = str(selected_path)
 
         self.current_result = None
 
-        self.transcription_text.delete(
-            "1.0",
-            "end",
-        )
-
-        tag = (
-            "rtl"
-            if self.language == "fa"
-            else "ltr"
-        )
-
-        self.transcription_text.insert(
-            "1.0",
-            t["no_transcription"],
-            tag,
+        self.main_page.transcription_text.set_text(
+            text["no_transcription"],
+            self.language == "fa",
         )
 
         self.set_status(
@@ -384,30 +507,30 @@ class UIOperationsMixin:
             self.current_audio,
         )
 
-    def start_recording(self):
+        self.logger.info(
+            "Audio state updated: current_audio=%s",
+            self.current_audio,
+        )
 
-        if (
-            self.processing
-            or self.recording
-        ):
+    # ========================================================
+    # Recording
+    # ========================================================
+
+    def start_recording(self):
+        if self.processing or self.recording:
             return
 
         try:
-
             config = self.load_config()
 
-            sample_rate = int(
-                config.get(
-                    "audio",
-                    {},
-                ).get(
-                    "sample_rate",
-                    16000,
-                )
+            rate = int(
+                config
+                .get("audio", {})
+                .get("sample_rate", 16000)
             )
 
             self.recorder = AudioRecorder(
-                sample_rate=sample_rate,
+                sample_rate=rate,
                 channels=1,
                 dtype="float32",
             )
@@ -417,10 +540,7 @@ class UIOperationsMixin:
             self.recording = True
             self.operation = "recording"
 
-            self.set_status(
-                "recording"
-            )
-
+            self.set_status("recording")
             self.refresh_controls()
 
             self.logger.info(
@@ -428,7 +548,6 @@ class UIOperationsMixin:
             )
 
         except Exception:
-
             self.logger.exception(
                 "Recording failed to start."
             )
@@ -436,18 +555,18 @@ class UIOperationsMixin:
             self.recording = False
             self.operation = None
 
-            self.set_status(
-                "error"
-            )
-
+            self.set_status("error")
             self.refresh_controls()
 
     def stop_recording(self):
-
         if not self.recording:
             return
 
         try:
+            if self.recorder is None:
+                raise RuntimeError(
+                    "Recorder is not initialized."
+                )
 
             output_path = (
                 self.recorder.generate_output_path(
@@ -455,35 +574,18 @@ class UIOperationsMixin:
                 )
             )
 
-            self.recorder.stop(
-                output_path
-            )
+            self.recorder.stop(output_path)
 
-            self.current_audio = Path(
-                output_path
-            )
-
-            self.audio_var.set(
-                str(self.current_audio)
-            )
+            self.current_audio = Path(output_path)
+            self.audio_var = str(self.current_audio)
 
             self.current_result = None
 
-            self.transcription_text.delete(
-                "1.0",
-                "end",
-            )
-
-            self.transcription_text.insert(
-                "1.0",
-                TEXTS[self.language][
-                    "no_transcription"
-                ],
-                (
-                    "rtl"
-                    if self.language == "fa"
-                    else "ltr"
-                ),
+            # IMPORTANT:
+            # transcription_text belongs to MainPage.
+            self.main_page.transcription_text.set_text(
+                self.TEXT["no_transcription"],
+                self.language == "fa",
             )
 
             self.logger.info(
@@ -494,12 +596,9 @@ class UIOperationsMixin:
             self.recording = False
             self.operation = None
 
-            self.set_status(
-                "recording_saved"
-            )
+            self.set_status("recording_saved")
 
         except Exception:
-
             self.logger.exception(
                 "Failed to stop recording."
             )
@@ -507,76 +606,81 @@ class UIOperationsMixin:
             self.recording = False
             self.operation = None
 
-            self.set_status(
-                "error"
-            )
+            self.set_status("error")
 
         finally:
-
             self.recorder = None
+
             self.refresh_controls()
 
-    def transcribe(self):
+            try:
+                self.files_page.reload()
+            except Exception:
+                self.logger.exception(
+                    "Failed to refresh files page."
+                )
 
-        if (
-            self.processing
-            or self.recording
-        ):
+    # ========================================================
+    # Transcription
+    # ========================================================
+
+    def transcribe(self):
+        if self.processing or self.recording:
             return
 
         if (
             not self.model_loaded
-            or self.engine is None
-            or self.chunker is None
+            or not self.engine
+            or not self.chunker
         ):
-
-            messagebox.showwarning(
-                TEXTS[self.language]["warning"],
-                TEXTS[self.language]["load_model_first"],
+            return QMessageBox.warning(
+                self,
+                self.TEXT["warning"],
+                self.TEXT["load_model_first"],
             )
-
-            return
 
         if not self.current_audio:
-
-            messagebox.showwarning(
-                TEXTS[self.language]["warning"],
-                TEXTS[self.language]["select_audio_first"],
+            return QMessageBox.warning(
+                self,
+                self.TEXT["warning"],
+                self.TEXT["select_audio_first"],
             )
 
+        audio_path = Path(self.current_audio)
+
+        if not audio_path.exists():
+            self.logger.error(
+                "Audio file does not exist: %s",
+                audio_path,
+            )
+
+            QMessageBox.warning(
+                self,
+                self.TEXT["warning"],
+                f"Audio file not found:\n{audio_path}",
+            )
+
+            self.current_audio = None
+            self.audio_var = ""
+
+            self.refresh_controls()
             return
 
-        audio_path = self.current_audio
         engine = self.engine
         chunker = self.chunker
 
         self.processing = True
         self.operation = "processing"
-
         self.current_result = None
 
-        self.progress_var.set(0)
-        self.progress_text_var.set("")
+        self.set_progress(0, "")
 
-        self.transcription_text.delete(
-            "1.0",
-            "end",
+        self.main_page.transcription_text.set_text(
+            self.TEXT["processing"],
+            self.language == "fa",
         )
 
-        self.transcription_text.insert(
-            "1.0",
-            TEXTS[self.language]["processing"],
-            (
-                "rtl"
-                if self.language == "fa"
-                else "ltr"
-            ),
-        )
-
-        self.set_status(
-            "processing"
-        )
-
+        self.set_status("processing")
         self.refresh_controls()
 
         self.logger.info(
@@ -584,7 +688,7 @@ class UIOperationsMixin:
             audio_path,
         )
 
-        thread = threading.Thread(
+        threading.Thread(
             target=self._transcription_worker,
             args=(
                 audio_path,
@@ -592,28 +696,22 @@ class UIOperationsMixin:
                 chunker,
             ),
             daemon=True,
-        )
-
-        thread.start()
+        ).start()
 
     def _transcription_worker(
         self,
-        audio_path: Path,
+        audio_path,
         engine,
         chunker,
     ):
-
-        file_start_time = time.perf_counter()
+        started = time.perf_counter()
 
         try:
-
             self.logger.info(
                 "Analyzing audio and creating chunks..."
             )
 
-            chunks = chunker.chunk_file(
-                audio_path
-            )
+            chunks = chunker.chunk_file(audio_path)
 
             if not chunks:
                 raise RuntimeError(
@@ -629,7 +727,6 @@ class UIOperationsMixin:
             )
 
             for chunk in chunks:
-
                 self.logger.info(
                     "Chunk %03d | %s -> %s | %.2f sec",
                     chunk.index,
@@ -638,52 +735,41 @@ class UIOperationsMixin:
                     chunk.duration,
                 )
 
-            self.root.after(
-                0,
-                lambda:
-                self._prepare_progress_ui(
-                    total
-                ),
+            self.ui_call(
+                lambda: self._prepare_progress_ui(total)
             )
 
             chunk_results = []
             texts = []
 
-            total_audio_duration = 0.0
-            total_inference_time = 0.0
-
-            self.logger.info(
-                "Starting transcription..."
-            )
+            total_audio = 0.0
+            total_inference = 0.0
 
             for position, chunk in enumerate(
                 chunks,
-                start=1,
+                1,
             ):
-
                 elapsed = (
                     time.perf_counter()
-                    - file_start_time
+                    - started
                 )
 
                 operation_text = (
-                    f"{TEXTS[self.language]['processing_chunk']} "
-                    f"{position} / {total}"
+                    TEXTS[self.language]["processing_chunk"]
+                    + f" {position} / {total}"
                 )
 
-                self.root.after(
-                    0,
+                self.ui_call(
                     lambda
-                    op=operation_text,
-                    i=position,
-                    total_chunks=total,
-                    e=elapsed:
+                    operation_text=operation_text,
+                    index=position,
+                    elapsed=elapsed:
                     self._update_processing_ui(
-                        op,
-                        i,
-                        total_chunks,
-                        e,
-                    ),
+                        operation_text,
+                        index,
+                        total,
+                        elapsed,
+                    )
                 )
 
                 self.logger.info(
@@ -693,102 +779,83 @@ class UIOperationsMixin:
                     chunk.index,
                 )
 
-                inference_start = (
+                inference_started = (
                     time.perf_counter()
                 )
 
-                raw_result = engine.transcribe(
+                raw = engine.transcribe(
                     chunk.audio,
                     sample_rate=chunker.sample_rate,
                 )
 
                 inference_time = (
                     time.perf_counter()
-                    - inference_start
+                    - inference_started
                 )
 
-                if isinstance(
-                    raw_result,
-                    dict,
-                ):
+                if isinstance(raw, dict):
                     text = str(
-                        raw_result.get(
-                            "text",
-                            "",
-                        )
+                        raw.get("text", "")
                     ).strip()
-
                 else:
                     text = str(
-                        raw_result or ""
+                        raw or ""
                     ).strip()
 
-                chunk_duration = float(
-                    chunk.duration
-                )
+                duration = float(chunk.duration)
 
-                total_audio_duration += (
-                    chunk_duration
-                )
-
-                total_inference_time += (
-                    inference_time
-                )
+                total_audio += duration
+                total_inference += inference_time
 
                 if text:
                     texts.append(text)
 
                 rtf = (
-                    inference_time
-                    / chunk_duration
-                    if chunk_duration > 0
+                    inference_time / duration
+                    if duration > 0
                     else None
                 )
 
                 realtime_factor = (
-                    chunk_duration
-                    / inference_time
+                    duration / inference_time
                     if inference_time > 0
                     else None
                 )
 
-                chunk_result = {
-                    "index": int(
-                        chunk.index
-                    ),
-                    "start": round(
-                        float(chunk.start),
-                        3,
-                    ),
-                    "end": round(
-                        float(chunk.end),
-                        3,
-                    ),
-                    "duration": round(
-                        chunk_duration,
-                        3,
-                    ),
-                    "inference_time": round(
-                        inference_time,
-                        3,
-                    ),
-                    "rtf": round(
-                        rtf,
-                        6,
-                    )
-                    if rtf is not None
-                    else None,
-                    "realtime_factor": round(
-                        realtime_factor,
-                        3,
-                    )
-                    if realtime_factor is not None
-                    else None,
-                    "text": text,
-                }
-
                 chunk_results.append(
-                    chunk_result
+                    {
+                        "index": int(chunk.index),
+                        "start": round(
+                            float(chunk.start),
+                            3,
+                        ),
+                        "end": round(
+                            float(chunk.end),
+                            3,
+                        ),
+                        "duration": round(
+                            duration,
+                            3,
+                        ),
+                        "inference_time": round(
+                            inference_time,
+                            3,
+                        ),
+                        "rtf": (
+                            round(rtf, 6)
+                            if rtf is not None
+                            else None
+                        ),
+                        "realtime_factor": (
+                            round(
+                                realtime_factor,
+                                3,
+                            )
+                            if realtime_factor is not None
+                            else None
+                        ),
+                        "text": text,
+                    }
                 )
 
                 self.logger.info(
@@ -797,55 +864,42 @@ class UIOperationsMixin:
                     "inference=%.2fs | "
                     "RTF=%.3f",
                     chunk.index,
-                    chunk_duration,
+                    duration,
                     inference_time,
-                    (
-                        rtf
-                        if rtf is not None
-                        else 0.0
-                    ),
+                    rtf or 0.0,
                 )
 
-                if text:
-                    self.logger.info(
-                        "Text: %s",
-                        text,
-                    )
-                else:
-                    self.logger.info(
-                        "Text: [empty]"
-                    )
+                self.logger.info(
+                    "Text: %s",
+                    text or "[empty]",
+                )
 
             final_text = " ".join(
-                text.strip()
-                for text in texts
-                if text and text.strip()
+                item.strip()
+                for item in texts
+                if item and item.strip()
             ).strip()
 
-            file_processing_time = (
+            elapsed = (
                 time.perf_counter()
-                - file_start_time
+                - started
             )
 
             overall_rtf = (
-                total_inference_time
-                / total_audio_duration
-                if total_audio_duration > 0
+                total_inference / total_audio
+                if total_audio > 0
                 else None
             )
 
-            overall_realtime_factor = (
-                total_audio_duration
-                / total_inference_time
-                if total_inference_time > 0
+            overall_realtime = (
+                total_audio / total_inference
+                if total_inference > 0
                 else None
             )
 
             config = self.load_config()
 
-            output_dir = self.get_output_dir(
-                config
-            )
+            output_dir = self.get_output_dir(config)
 
             txt_path = (
                 output_dir
@@ -873,7 +927,6 @@ class UIOperationsMixin:
             )
 
             if save_txt:
-
                 txt_path.write_text(
                     final_text + "\n",
                     encoding="utf-8",
@@ -884,102 +937,79 @@ class UIOperationsMixin:
                     txt_path,
                 )
 
-            if save_json:
-
-                model_path = (
-                    PROJECT_ROOT
-                    / config.get(
-                        "model",
-                        {},
-                    ).get(
-                        "path",
-                        "",
-                    )
-                )
-
-                json_data = {
-                    "file": {
-                        "name": audio_path.name,
-                        "path": str(
-                            audio_path
-                        ),
-                        "extension": (
-                            audio_path.suffix.lower()
-                        ),
-                    },
-
-                    "engine": {
-                        "name": config.get(
-                            "engine",
-                            {},
-                        ).get(
-                            "name"
-                        ),
-                        "model_path": str(
-                            model_path
-                        ),
-                    },
-
-                    "audio": {
-                        "sample_rate": (
-                            chunker.sample_rate
-                        ),
-                        "language": config.get(
-                            "audio",
-                            {},
-                        ).get(
-                            "language",
-                            "fa",
-                        ),
-                        "task": config.get(
-                            "audio",
-                            {},
-                        ).get(
-                            "task",
-                            "transcribe",
-                        ),
-                        "duration": round(
-                            total_audio_duration,
-                            3,
-                        ),
-                    },
-
-                    "processing": {
-                        "chunks": len(
-                            chunks
-                        ),
-                        "inference_time": round(
-                            total_inference_time,
-                            3,
-                        ),
-                        "total_processing_time": round(
-                            file_processing_time,
-                            3,
-                        ),
-                        "rtf": round(
+            result = {
+                "file": {
+                    "name": audio_path.name,
+                    "path": str(audio_path),
+                    "extension": audio_path.suffix.lower(),
+                },
+                "engine": {
+                    "name": (
+                        config
+                        .get("engine", {})
+                        .get("name")
+                    ),
+                    "model_path": str(
+                        PROJECT_ROOT
+                        / config
+                        .get("model", {})
+                        .get("path", "")
+                    ),
+                },
+                "audio": {
+                    "sample_rate": chunker.sample_rate,
+                    "language": (
+                        config
+                        .get("audio", {})
+                        .get("language", "fa")
+                    ),
+                    "task": (
+                        config
+                        .get("audio", {})
+                        .get("task", "transcribe")
+                    ),
+                    "duration": round(
+                        total_audio,
+                        3,
+                    ),
+                },
+                "processing": {
+                    "chunks": len(chunks),
+                    "inference_time": round(
+                        total_inference,
+                        3,
+                    ),
+                    "total_processing_time": round(
+                        elapsed,
+                        3,
+                    ),
+                    "rtf": (
+                        round(
                             overall_rtf,
                             6,
                         )
                         if overall_rtf is not None
-                        else None,
-                        "realtime_factor": round(
-                            overall_realtime_factor,
+                        else None
+                    ),
+                    "realtime_factor": (
+                        round(
+                            overall_realtime,
                             3,
                         )
-                        if overall_realtime_factor is not None
-                        else None,
-                    },
+                        if overall_realtime is not None
+                        else None
+                    ),
+                },
+                "transcription": {
+                    "text": final_text,
+                },
+                "chunks": chunk_results,
+            }
 
-                    "transcription": {
-                        "text": final_text,
-                    },
-
-                    "chunks": chunk_results,
-                }
-
+            if save_json:
                 json_path.write_text(
                     json.dumps(
-                        json_data,
+                        result,
                         ensure_ascii=False,
                         indent=2,
                     ),
@@ -991,178 +1021,63 @@ class UIOperationsMixin:
                     json_path,
                 )
 
-            self.logger.info("")
-            self.logger.info(
-                "-" * 60
-            )
-
-            self.logger.info(
-                "FILE COMPLETED"
-            )
-
-            self.logger.info(
-                "File       : %s",
-                audio_path.name,
-            )
-
-            self.logger.info(
-                "Audio      : %.2f sec",
-                total_audio_duration,
-            )
-
-            self.logger.info(
-                "Chunks     : %d",
-                len(chunks),
-            )
-
-            self.logger.info(
-                "Inference  : %.2f sec",
-                total_inference_time,
-            )
-
-            self.logger.info(
-                "Total time : %.2f sec",
-                file_processing_time,
-            )
-
-            if overall_rtf is not None:
-                self.logger.info(
-                    "RTF        : %.3f",
-                    overall_rtf,
-                )
-
-            if overall_realtime_factor is not None:
-                self.logger.info(
-                    "Realtime   : %.2fx",
-                    overall_realtime_factor,
-                )
-
-            self.logger.info(
-                "-" * 60
-            )
-
-            result = {
-                "file": {
-                    "name": audio_path.name,
-                    "path": str(audio_path),
-                    "extension": audio_path.suffix.lower(),
-                },
-
-                "engine": {
-                    "name": config.get(
-                        "engine",
-                        {},
-                    ).get(
-                        "name"
-                    ),
-                    "model_path": str(
-                        PROJECT_ROOT
-                        / config.get(
-                            "model",
-                            {},
-                        ).get(
-                            "path",
-                            "",
-                        )
-                    ),
-                },
-
-                "audio": {
-                    "sample_rate": (
-                        chunker.sample_rate
-                    ),
-                    "language": config.get(
-                        "audio",
-                        {},
-                    ).get(
-                        "language",
-                        "fa",
-                    ),
-                    "task": config.get(
-                        "audio",
-                        {},
-                    ).get(
-                        "task",
-                        "transcribe",
-                    ),
-                    "duration": round(
-                        total_audio_duration,
-                        3,
-                    ),
-                },
-
-                "processing": {
-                    "chunks": len(chunks),
-                    "inference_time": round(
-                        total_inference_time,
-                        3,
-                    ),
-                    "total_processing_time": round(
-                        file_processing_time,
-                        3,
-                    ),
-                    "rtf": round(
-                        overall_rtf,
-                        6,
-                    )
-                    if overall_rtf is not None
-                    else None,
-                    "realtime_factor": round(
-                        overall_realtime_factor,
-                        3,
-                    )
-                    if overall_realtime_factor is not None
-                    else None,
-                },
-
-                "transcription": {
-                    "text": final_text,
-                },
-
-                "chunks": chunk_results,
-            }
-
             self.current_result = result
 
-            self.root.after(
-                0,
-                lambda:
-                self._transcription_completed_ui(
+            self.logger.info(
+                "FILE COMPLETED | "
+                "File: %s | "
+                "Audio: %.2f sec | "
+                "Chunks: %d | "
+                "Inference: %.2f sec | "
+                "Total: %.2f sec",
+                audio_path.name,
+                total_audio,
+                len(chunks),
+                total_inference,
+                elapsed,
+            )
+
+            self.ui_call(
+                lambda: self._transcription_completed_ui(
                     final_text,
                     result,
-                    file_processing_time,
-                ),
+                    elapsed,
+                )
             )
 
         except Exception:
-
             self.logger.exception(
                 "Failed processing file: %s",
                 audio_path.name,
             )
 
-            self.root.after(
-                0,
-                self._transcription_failed_ui,
+            self.ui_call(
+                self._transcription_failed_ui
             )
 
-    def _prepare_progress_ui(
-        self,
-        total,
-    ):
+    # ========================================================
+    # Processing UI
+    # ========================================================
 
-        self.progress.configure(
-            mode="determinate",
-            maximum=max(
-                total,
-                1,
-            ),
+    def _prepare_progress_ui(self, total):
+        """
+        Prepare progress controls.
+
+        These widgets belong to MainPage.
+        """
+
+        self.main_page.progress.setRange(
+            0,
+            max(total, 1),
         )
 
-        self.progress_var.set(0)
+        self.main_page.operation_label.setText(
+            ""
+        )
 
-        self.progress_text_var.set(
-            f"0 / {total}"
+        self.set_progress(
+            0,
+            f"0 / {total}",
         )
 
     def _update_processing_ui(
@@ -1172,26 +1087,29 @@ class UIOperationsMixin:
         total,
         elapsed,
     ):
+        """
+        Update processing progress.
 
-        self.operation_var.set(
+        This method is called on the Qt UI thread.
+        """
+
+        self.main_page.operation_label.setText(
             operation
         )
 
-        self.progress.configure(
-            maximum=max(
-                total,
-                1,
+        self.main_page.progress.setRange(
+            0,
+            max(total, 1),
+        )
+
+        self.set_progress(
+            index,
+            (
+                f"{index} / {total}"
+                f"  •  "
+                f"{TEXTS[self.language]['elapsed']}: "
+                f"{elapsed:.1f}s"
             ),
-        )
-
-        self.progress_var.set(
-            index
-        )
-
-        self.progress_text_var.set(
-            f"{index} / {total}  •  "
-            f"{TEXTS[self.language]['elapsed']}: "
-            f"{elapsed:.1f}s"
         )
 
     def _transcription_completed_ui(
@@ -1200,326 +1118,246 @@ class UIOperationsMixin:
         result,
         elapsed,
     ):
-
         self.processing = False
         self.operation = None
 
-        total_chunks = result[
-            "processing"
-        ][
-            "chunks"
-        ]
+        total = result["processing"]["chunks"]
 
-        self.progress_var.set(
-            total_chunks
+        self.main_page.progress.setRange(
+            0,
+            max(total, 1),
         )
 
-        self.progress.configure(
-            maximum=max(
-                total_chunks,
-                1
-            )
+        self.set_progress(
+            total,
+            f"{total} / {total}",
         )
 
-        self.progress_text_var.set(
-            f"{total_chunks} / {total_chunks}"
+        self.main_page.transcription_text.set_text(
+            text or self.TEXT["no_transcription"],
+            self.language == "fa",
         )
 
-        self.transcription_text.delete(
-            "1.0",
-            "end",
-        )
-
-        tag = (
-            "rtl"
-            if self.language == "fa"
-            else "ltr"
-        )
-
-        self.transcription_text.insert(
-            "1.0",
-            (
-                text
-                or TEXTS[self.language][
-                    "no_transcription"
-                ]
-            ),
-            tag,
+        self.main_page.operation_label.setText(
+            ""
         )
 
         self.set_status(
             "completed",
             (
-                f"{TEXTS[self.language]['elapsed']}: "
+                f"{self.TEXT['elapsed']}: "
                 f"{elapsed:.2f}s"
             ),
         )
 
         self.refresh_controls()
 
-    def _transcription_failed_ui(self):
+        try:
+            self.files_page.reload()
+        except Exception:
+            self.logger.exception(
+                "Failed to refresh files page after transcription."
+            )
 
+    def _transcription_failed_ui(self):
         self.processing = False
         self.operation = None
 
-        self.set_status(
-            "error"
-        )
+        self.main_page.operation_label.setText("")
 
-        self.transcription_text.delete(
-            "1.0",
-            "end",
-        )
-
-        self.transcription_text.insert(
-            "1.0",
-            TEXTS[self.language][
-                "transcription_failed"
-            ],
-            (
-                "rtl"
-                if self.language == "fa"
-                else "ltr"
-            ),
-        )
-
+        self.set_status("error")
         self.refresh_controls()
 
-        messagebox.showerror(
-            TEXTS[self.language]["error"],
-            TEXTS[self.language][
-                "transcription_failed"
-            ],
+        QMessageBox.critical(
+            self,
+            self.TEXT["error"],
+            self.TEXT["transcription_failed"],
         )
 
-    def export_txt(self):
+    # ========================================================
+    # Export TXT
+    # ========================================================
 
+    def export_txt(self):
         if not self.current_result:
             return
 
         text = (
-            self.current_result.get(
-                "transcription",
-                {},
-            )
+            self.current_result
+            .get("transcription", {})
+            .get("text", "")
         )
 
-        if isinstance(text, dict):
-            text = text.get(
-                "text",
-                "",
-            )
-
-        default_name = (
+        filename = (
             Path(
-                self.current_result.get(
-                    "file",
-                    {},
-                ).get(
-                    "name",
-                    "transcription",
-                )
-                if isinstance(
-                    self.current_result.get(
-                        "file"
-                    ),
-                    dict,
-                )
-                else self.current_result.get(
-                    "file",
-                    "transcription",
-                )
+                self.current_result
+                .get("file", {})
+                .get("name", "transcription")
             ).stem
             + ".txt"
         )
 
-        path = filedialog.asksaveasfilename(
-            title=TEXTS[self.language][
-                "export_txt"
-            ],
-            initialdir=str(
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.TEXT["export_txt"],
+            str(
                 DEFAULT_OUTPUT_DIR
+                / filename
             ),
-            initialfile=default_name,
-            defaultextension=".txt",
-            filetypes=[
+            "TXT (*.txt)",
+        )
+
+        if path:
+            Path(path).write_text(
+                text,
+                encoding="utf-8",
+            )
+
+            self.logger.info(
+                "TXT exported: %s",
+                path,
+            )
+
+            QMessageBox.information(
+                self,
+                self.TEXT["success"],
                 (
-                    "TXT",
-                    "*.txt",
+                    f"{self.TEXT['saved_txt']}\n"
+                    f"{path}"
                 ),
-            ],
-        )
+            )
 
-        if not path:
-            return
+            self.files_page.reload()
 
-        Path(path).write_text(
-            str(text),
-            encoding="utf-8",
-        )
-
-        self.logger.info(
-            "TXT exported: %s",
-            path,
-        )
-
-        messagebox.showinfo(
-            TEXTS[self.language]["success"],
-            (
-                f"{TEXTS[self.language]['saved_txt']}\n"
-                f"{path}"
-            ),
-        )
+    # ========================================================
+    # Export JSON
+    # ========================================================
 
     def export_json(self):
-
         if not self.current_result:
             return
 
-        file_data = self.current_result.get(
-            "file",
-            {},
-        )
-
-        if isinstance(
-            file_data,
-            dict,
-        ):
-            filename = file_data.get(
-                "name",
-                "transcription",
-            )
-        else:
-            filename = str(
-                file_data
-            )
-
-        default_name = (
-            Path(filename).stem
+        filename = (
+            Path(
+                self.current_result
+                .get("file", {})
+                .get("name", "transcription")
+            ).stem
             + ".json"
         )
 
-        path = filedialog.asksaveasfilename(
-            title=TEXTS[self.language][
-                "export_json"
-            ],
-            initialdir=str(
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.TEXT["export_json"],
+            str(
                 DEFAULT_OUTPUT_DIR
+                / filename
             ),
-            initialfile=default_name,
-            defaultextension=".json",
-            filetypes=[
-                (
-                    "JSON",
-                    "*.json",
+            "JSON (*.json)",
+        )
+
+        if path:
+            Path(path).write_text(
+                json.dumps(
+                    self.current_result,
+                    ensure_ascii=False,
+                    indent=2,
                 ),
-            ],
-        )
+                encoding="utf-8",
+            )
 
-        if not path:
-            return
+            self.logger.info(
+                "JSON exported: %s",
+                path,
+            )
 
-        Path(path).write_text(
-            json.dumps(
-                self.current_result,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+            QMessageBox.information(
+                self,
+                self.TEXT["success"],
+                (
+                    f"{self.TEXT['saved_json']}\n"
+                    f"{path}"
+                ),
+            )
 
-        self.logger.info(
-            "JSON exported: %s",
-            path,
-        )
+            self.files_page.reload()
 
-        messagebox.showinfo(
-            TEXTS[self.language]["success"],
-            (
-                f"{TEXTS[self.language]['saved_json']}\n"
-                f"{path}"
-            ),
-        )
+    # ========================================================
+    # Open output
+    # ========================================================
 
     def open_output(self):
+        try:
+            self.open_path(
+                self.get_output_dir(
+                    self.load_config()
+                )
+            )
+        except Exception:
+            self.open_path(
+                DEFAULT_OUTPUT_DIR
+            )
+
+    def open_path(self, path):
+        path = Path(path)
 
         try:
-
-            try:
-                config = self.load_config()
-                output_dir = self.get_output_dir(
-                    config
-                )
-            except Exception:
-                output_dir = DEFAULT_OUTPUT_DIR
-
             if os.name == "nt":
-
-                os.startfile(
-                    output_dir
-                )
+                os.startfile(str(path))
 
             elif sys.platform == "darwin":
+                import subprocess
 
-                os.system(
-                    f'open "{output_dir}"'
+                subprocess.run(
+                    [
+                        "open",
+                        str(path),
+                    ]
                 )
 
             else:
+                import subprocess
 
-                os.system(
-                    f'xdg-open "{output_dir}"'
+                subprocess.run(
+                    [
+                        "xdg-open",
+                        str(path),
+                    ]
                 )
 
         except Exception:
-
             self.logger.exception(
-                "Could not open output directory."
+                "Could not open path: %s",
+                path,
             )
 
-    # --------------------------------------------------------
-    # Copy complete transcription
-    # --------------------------------------------------------
+    # ========================================================
+    # Copy transcription
+    # ========================================================
 
     def copy_transcription_text(self):
+        """
+        Copy transcription text without direction-control
+        characters that can disturb Persian text selection.
+        """
 
-        try:
-
-            text = self.transcription_text.get(
-                "1.0",
-                "end-1c",
-            )
-
-        except tk.TclError:
-
-            return "break"
-
-        if not text:
-            return "break"
-
-        # Normalize line endings.
-        text = text.replace(
-            "\r\n",
-            "\n",
-        ).replace(
-            "\r",
-            "\n",
+        text = (
+            self.main_page.transcription_text
+            .toPlainText()
         )
 
-        # Remove invisible directional formatting characters
-        # if any were introduced by future RTL handling.
         directional_chars = (
-            "\u200e",  # LRM
-            "\u200f",  # RLM
-            "\u202a",  # LRE
-            "\u202b",  # RLE
-            "\u202c",  # PDF
-            "\u202d",  # LRO
-            "\u202e",  # RLO
-            "\u2066",  # LRI
-            "\u2067",  # RLI
-            "\u2068",  # FSI
-            "\u2069",  # PDI
+            "\u200e",
+            "\u200f",
+            "\u202a",
+            "\u202b",
+            "\u202c",
+            "\u202d",
+            "\u202e",
+            "\u2066",
+            "\u2067",
+            "\u2068",
+            "\u2069",
         )
 
         for char in directional_chars:
@@ -1528,181 +1366,63 @@ class UIOperationsMixin:
                 "",
             )
 
-        try:
+        text = (
+            text
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+        )
 
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
+        QGuiApplication.clipboard().setText(text)
 
-            # Keep clipboard available after the application
-            # remains active.
-            self.root.update()
+        self.logger.info(
+            "Transcription copied to clipboard."
+        )
 
-            self.logger.info(
-                "Transcription copied to clipboard."
-            )
-
-        except tk.TclError:
-
-            self.logger.exception(
-                "Could not copy transcription to clipboard."
-            )
-
-        return "break"
+    # ========================================================
+    # Logs
+    # ========================================================
 
     def process_log_queue(self):
-
-        while True:
-
+        while not self.log_queue.empty():
             try:
-                message = (
-                    self.log_queue.get_nowait()
-                )
+                message = self.log_queue.get_nowait()
 
-            except queue.Empty:
+                self.insert_log(message)
+
+            except Exception:
                 break
 
-            self.insert_log(
-                message
+    def insert_log(self, message):
+        if message:
+            self.logs_page.text.appendPlainText(
+                message.rstrip()
             )
-
-        try:
-            self.root.after(
-                80,
-                self.process_log_queue,
-            )
-        except tk.TclError:
-            pass
-
-    def insert_log(
-        self,
-        message,
-    ):
-
-        if not message:
-            return
-
-        level = "DEFAULT"
-
-        if re.search(
-            r"\|\s*ERROR\s*\|",
-            message,
-            re.IGNORECASE,
-        ):
-            level = "ERROR"
-
-        elif re.search(
-            r"\|\s*WARNING\s*\|",
-            message,
-            re.IGNORECASE,
-        ):
-            level = "WARNING"
-
-        elif re.search(
-            r"\|\s*DEBUG\s*\|",
-            message,
-            re.IGNORECASE,
-        ):
-            level = "DEBUG"
-
-        elif re.search(
-            r"\|\s*INFO\s*\|",
-            message,
-            re.IGNORECASE,
-        ):
-            level = "INFO"
-
-        self.logs_text.configure(
-            state="normal"
-        )
-
-        self.logs_text.insert(
-            "end",
-            message.rstrip() + "\n",
-            level,
-        )
-
-        self.logs_text.see(
-            "end"
-        )
-
-        self.logs_text.configure(
-            state="disabled"
-        )
 
     def clear_logs(self):
+        self.logs_page.text.clear()
 
-        self.logs_text.configure(
-            state="normal"
-        )
-
-        self.logs_text.delete(
-            "1.0",
-            "end",
-        )
-
-        self.logs_text.configure(
-            state="disabled"
-        )
-
-    def setup_cursor(
-        self,
-        widget,
-        cursor="arrow",
-    ):
-
-        try:
-            widget.configure(
-                cursor=cursor
-            )
-        except tk.TclError:
-            pass
-
-    def setup_button_cursor(
-        self,
-        button,
-    ):
-
-        try:
-            button.configure(
-                cursor="hand2"
-            )
-        except tk.TclError:
-            pass
+    # ========================================================
+    # Close
+    # ========================================================
 
     def on_close(self):
-
-        if (
-            self.processing
-            or self.recording
-        ):
-
-            answer = messagebox.askyesno(
-                TEXTS[self.language][
-                    "confirm_close_title"
-                ],
-                TEXTS[self.language][
-                    "confirm_close"
-                ],
+        if self.processing or self.recording:
+            answer = QMessageBox.question(
+                self,
+                self.TEXT["confirm_close_title"],
+                self.TEXT["confirm_close"],
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
             )
 
-            if not answer:
+            if answer != QMessageBox.Yes:
                 return
 
         try:
-
-            if (
-                self.recording
-                and self.recorder
-            ):
+            if self.recording and self.recorder:
                 self.recorder.cancel()
 
-        except Exception:
-            pass
-
-        try:
-
             if self.engine:
-
                 self.logger.info(
                     "Unloading engine before exit..."
                 )
@@ -1710,99 +1430,15 @@ class UIOperationsMixin:
                 self.engine.unload()
 
         except Exception:
-
             self.logger.exception(
                 "Error while unloading engine during exit."
             )
 
-        self.stop_spinner()
+        self.settings.save(
+            language=self.language,
+            theme=self.theme_name,
+            last_tab=self.tabs.currentIndex(),
+        )
 
-        try:
-            self.root.destroy()
-        except tk.TclError:
-            pass
+        self.close()
 
-    def _select_all_transcription(self, event=None):
-
-        try:
-
-            self.transcription_text.tag_remove(
-                "sel",
-                "1.0",
-                "end",
-            )
-
-            self.transcription_text.tag_add(
-                "sel",
-                "1.0",
-                "end-1c",
-            )
-
-            self.transcription_text.mark_set(
-                "insert",
-                "end-1c",
-            )
-
-            self.transcription_text.see(
-                "insert"
-            )
-
-            return "break"
-
-        except tk.TclError:
-
-            return "break"
-
-    def _copy_transcription(self, event=None):
-
-        try:
-
-            try:
-                text = self.transcription_text.get(
-                    "sel.first",
-                    "sel.last",
-                )
-
-            except tk.TclError:
-                text = ""
-
-            if not text:
-                return "break"
-
-            text = text.replace(
-                "\r\n",
-                "\n",
-            ).replace(
-                "\r",
-                "\n",
-            )
-
-            directional_chars = (
-                "\u200e",
-                "\u200f",
-                "\u202a",
-                "\u202b",
-                "\u202c",
-                "\u202d",
-                "\u202e",
-                "\u2066",
-                "\u2067",
-                "\u2068",
-                "\u2069",
-            )
-
-            for char in directional_chars:
-                text = text.replace(
-                    char,
-                    "",
-                )
-
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-            self.root.update()
-
-            return "break"
-
-        except tk.TclError:
-
-            return "break"
