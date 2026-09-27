@@ -1,0 +1,184 @@
+{
+  "speaker": "SPEAKER_01",
+  "source_audio": "D:\\Projects\\persian_asr\\tests\\diarization\\samples\\audio_2026-09-26_11-24-38.ogg",
+  "source_sample_rate": 16000,
+  "output_audio": "D:\\Projects\\persian_asr\\tests\\speaker_isolation\\output\\SPEAKER_01.wav",
+  "output_sample_rate": 16000,
+  "method": "diarization_based_non_overlap_isolation",
+  "source_speech_duration_seconds": 36.45,
+  "clean_speech_duration_seconds": 24.013124999999995,
+  "overlap_duration_seconds": 12.436875000000004,
+  "output_audio_duration_seconds": 6.12125,
+  "clean_intervals": [
+    {
+      "start": 1.71846875,
+      "end": 7.759718750000001,
+      "duration": 6.041250000000002
+    },
+    {
+      "start": 26.10284375,
+      "end": 27.03096875,
+      "duration": 0.9281249999999979
+    },
+    {
+      "start": 38.89409375,
+      "end": 40.142843750000004,
+      "duration": 1.2487500000000011
+    },
+    {
+      "start": 51.297218750000006,
+      "end": 51.98909375,
+      "duration": 0.691874999999996
+    },
+    {
+      "start": 52.52909375,
+      "end": 52.76534375,
+      "duration": 0.2362499999999983
+    },
+    {
+      "start": 62.97471875,
+      "end": 66.41721875,
+      "duration": 3.4425000000000026
+    },
+    {
+      "start": 66.88971875,
+      "end": 69.28596875000001,
+      "duration": 2.396250000000009
+    },
+    {
+      "start": 69.74159375,
+      "end": 72.72846875,
+      "duration": 2.9868749999999977
+    },
+    {
+      "start": 73.09971875000001,
+      "end": 78.66846875,
+      "duration": 5.568749999999994
+    },
+    {
+      "start": 82.83659375,
+      "end": 83.30909375,
+      "duration": 0.4724999999999966
+    }
+  ],
+  "overlap_intervals": [
+    {
+      "start": 23.95971875,
+      "end": 26.10284375,
+      "duration": 2.1431250000000013,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 34.236593750000004,
+      "end": 38.89409375,
+      "duration": 4.657499999999999,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 40.142843750000004,
+      "end": 41.47596875,
+      "duration": 1.3331249999999955,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 51.17909375,
+      "end": 51.297218750000006,
+      "duration": 0.11812500000000625,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 51.98909375,
+      "end": 52.360343750000006,
+      "duration": 0.3712500000000034,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 56.44409375,
+      "end": 58.33409375,
+      "duration": 1.8900000000000006,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 62.89034375000001,
+      "end": 62.97471875,
+      "duration": 0.08437499999999432,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 66.41721875,
+      "end": 66.88971875,
+      "duration": 0.4724999999999966,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 69.28596875000001,
+      "end": 69.74159375,
+      "duration": 0.4556249999999977,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 72.72846875,
+      "end": 73.09971875000001,
+      "duration": 0.3712500000000034,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 78.66846875,
+      "end": 78.83721875,
+      "duration": 0.16875000000000284,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    },
+    {
+      "start": 95.72909375,
+      "end": 96.10034375000001,
+      "duration": 0.3712500000000034,
+      "speakers": [
+        "SPEAKER_00",
+        "SPEAKER_01"
+      ]
+    }
+  ],
+  "output_mapping": [
+    {
+      "source_start": 1.71846875,
+      "source_end": 7.759718750000001,
+      "source_duration": 6.041250000000002,
+      "output_start": 0.0,
+      "output_end": 6.04125,
+      "output_duration": 6.04125
+    }
+  ]
+}

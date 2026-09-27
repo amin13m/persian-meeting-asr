@@ -6,22 +6,43 @@ project:
   name: persian_asr
   mode: offline
 
-
 # ============================================================
-# Engine
+# Main ASR Engine
 # ============================================================
 
 engine:
   name: whisper_persian_v4
 
-
-# ============================================================
-# Model
-# ============================================================
-
 model:
   path: models/whisper_persian_v4
 
+# ============================================================
+# Diarization
+# ============================================================
+
+diarization:
+  enabled: true
+
+  engine: pyannote
+
+  # Local offline model
+  model_path: models/diarization/speaker-diarization-community-1
+
+  sample_rate: 16000
+
+  device: cuda
+
+  # اگر null باشند، مدل خودش تعداد گوینده‌ها را تخمین می‌زند.
+  min_speakers: 1
+  max_speakers: 2
+
+  # خروجی‌ها
+  save_rttm: true
+  save_json: true
+  save_turns: true
+
+  # برای merge بهتر با ASR
+  use_exclusive: true
 
 # ============================================================
 # Audio
@@ -32,6 +53,8 @@ audio:
   output_dir: output
 
   sample_rate: 16000
+  channels: 1
+
   language: fa
   task: transcribe
 
@@ -42,48 +65,53 @@ audio:
     - .m4a
     - .ogg
 
+# ============================================================
+# Audio Preprocessing
+# ============================================================
+
+preprocessing:
+  enabled: true
+
+  # تبدیل همه ورودی‌ها به 16 kHz
+  resample:
+    enabled: true
+    sample_rate: 16000
+
+  # تبدیل به mono
+  mono:
+    enabled: true
+
+  # فعلاً خاموش.
+  # بعد از تست ASR و diarization، enhancement را جداگانه اضافه می‌کنیم.
+  enhancement:
+    enabled: false
+
+    engine: null
+
+    denoise: false
+    dereverb: false
+    normalization: false
 
 # ============================================================
-# Chunking
+# Whisper Chunking
 # ============================================================
 
 chunking:
-
-  # Enable automatic long-audio chunking
   enabled: true
 
-  # Maximum duration of each chunk
-  # Whisper can process longer audio, but keeping chunks
-  # bounded improves stability and memory usage.
   max_chunk_seconds: 30
-
-  # Minimum useful speech segment
   min_chunk_seconds: 0.5
 
-  # Silence detection threshold.
-  #
-  # Lower value = more sensitive to quiet speech.
-  # Higher value = requires louder speech.
-  #
-  # librosa.effects.split uses top_db relative to signal level.
+  # تشخیص سکوت
   silence_top_db: 30
-
-  # Minimum silence duration required to create
-  # a meaningful boundary.
   min_silence_seconds: 0.35
 
-  # Extra audio before each detected speech region.
-  # Helps prevent cutting the beginning of words.
+  # کمی context اطراف هر chunk
   padding_before_seconds: 0.20
-
-  # Extra audio after each detected speech region.
   padding_after_seconds: 0.20
 
-  # If a continuous speech region is longer than
-  # max_chunk_seconds, split it at the best available
-  # internal boundary.
+  # اگر split بر اساس silence جواب نداد
   fallback_split_seconds: 30
-
 
 # ============================================================
 # Output
@@ -93,18 +121,21 @@ output:
   save_txt: true
   save_json: true
 
-  # Save chunk-level information in JSON
   save_chunks: true
 
+  # خروجی speaker turns
+  save_speaker_turns: true
+
+  # استاندارد diarization
+  save_rttm: true
 
 # ============================================================
-# Device
+# Compute
 # ============================================================
 
 device:
   type: cuda
   dtype: float16
-
 
 # ============================================================
 # Logging
