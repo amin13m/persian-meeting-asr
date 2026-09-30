@@ -33,8 +33,8 @@ diarization:
   device: cuda
 
   # اگر null باشند، مدل خودش تعداد گوینده‌ها را تخمین می‌زند.
-  min_speakers: 1
-  max_speakers: 2
+  min_speakers: 3
+  max_speakers: 5
 
   # خروجی‌ها
   save_rttm: true

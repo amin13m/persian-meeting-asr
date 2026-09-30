@@ -112,8 +112,12 @@ class PersianASRApp(
         self.engine = None
         self.chunker = None
         self.recorder = None
-
         self.operation = None
+        
+        self.pipeline = None
+        
+        self.current_output_txt = None
+        self.current_output_json = None
 
         # ----------------------------------------------------
         # Logging

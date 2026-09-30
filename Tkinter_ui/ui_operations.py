@@ -2,132 +2,351 @@ from __future__ import annotations
 
 import json
 import logging
-import math
-import os
 import queue
-import re
+import shutil
+import subprocess
 import sys
-import threading
 import time
-import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox
 
-from engines.audio_chunker import AudioChunker
-from ui.logger import UILogHandler
-from ui.recorder import AudioRecorder
+from PySide6.QtCore import Qt
 
-from .ui_constants import (
-    CONFIG_PATH,
-    DEFAULT_INPUT_DIR,
-    DEFAULT_OUTPUT_DIR,
-    ENGINE_REGISTRY,
-    PROJECT_ROOT,
-    RECORDINGS_DIR,
-    TEXTS,
-    format_seconds,
-)
+from engines.whisper_persian_v4.engine import WhisperPersianV4Engine
+from pipeline.meeting_pipeline import MeetingPipeline
+
+try:
+    from .ui_constants import (
+        CONFIG_PATH,
+        DEFAULT_INPUT_DIR,
+        DEFAULT_OUTPUT_DIR,
+        ENGINE_REGISTRY,
+        PROJECT_ROOT,
+        RECORDINGS_DIR,
+        TEXTS,
+        format_seconds,
+    )
+    from .recorder import AudioRecorder
+except ImportError:
+    UI_DIR = Path(__file__).resolve().parent
+
+    if str(UI_DIR.parent) not in sys.path:
+        sys.path.insert(0, str(UI_DIR.parent))
+
+    from ui.ui_constants import (
+        CONFIG_PATH,
+        DEFAULT_INPUT_DIR,
+        DEFAULT_OUTPUT_DIR,
+        ENGINE_REGISTRY,
+        PROJECT_ROOT,
+        RECORDINGS_DIR,
+        TEXTS,
+        format_seconds,
+    )
+    from ui.recorder import AudioRecorder
+
+
+logger = logging.getLogger("PersianASR.UI")
 
 
 class UIOperationsMixin:
+    # ============================================================
+    # UI THREAD BRIDGE
+    # ============================================================
+
+    def ui_call(self, callback):
+        self.ui_bridge.signal.emit(callback)
+
+    # ============================================================
+    # CONFIG
+    # ============================================================
+
+    def load_config(self):
+        if not CONFIG_PATH.exists():
+            raise FileNotFoundError(
+                f"Configuration file not found: {CONFIG_PATH}"
+            )
+
+        import yaml
+
+        config = yaml.safe_load(
+            CONFIG_PATH.read_text(encoding="utf-8")
+        )
+
+        if not isinstance(config, dict):
+            raise ValueError(
+                "Configuration file is empty or invalid."
+            )
+
+        return config
+
+    # ============================================================
+    # PATH HELPERS
+    # ============================================================
+
+    def _resolve_project_path(self, value, default=None):
+        if value is None:
+            value = default
+
+        if value is None:
+            raise ValueError("Path value is not defined.")
+
+        path = Path(value)
+
+        if path.is_absolute():
+            return path
+
+        return PROJECT_ROOT / path
+
+    def get_input_dir(self, config):
+        value = (
+            config.get("audio", {})
+            .get("input_dir", DEFAULT_INPUT_DIR)
+        )
+
+        path = self._resolve_project_path(
+            value,
+            DEFAULT_INPUT_DIR,
+        )
+
+        path.mkdir(parents=True, exist_ok=True)
+
+        return path
+
+    def get_output_dir(self, config):
+        value = (
+            config.get("audio", {})
+            .get("output_dir", DEFAULT_OUTPUT_DIR)
+        )
+
+        path = self._resolve_project_path(
+            value,
+            DEFAULT_OUTPUT_DIR,
+        )
+
+        path.mkdir(parents=True, exist_ok=True)
+
+        return path
+
+    # ============================================================
+    # CONTROL STATE
+    # ============================================================
+
+    def refresh_controls(self):
+        try:
+            loaded = bool(getattr(self, "model_loaded", False))
+            processing = bool(getattr(self, "processing", False))
+            recording = bool(getattr(self, "recording", False))
+            audio = bool(getattr(self, "current_audio", None))
+            engine = bool(getattr(self, "engine", None))
+            chunker = bool(getattr(self, "chunker", None))
+
+            can_select = not processing and not recording
+            can_transcribe = (
+                not processing
+                and not recording
+                and loaded
+                and audio
+                and engine
+            )
+
+            self.logger.info(
+                "CONTROLS | "
+                "processing=%s recording=%s loaded=%s audio=%s "
+                "engine=%s chunker=%s | select=%s transcribe=%s",
+                processing,
+                recording,
+                loaded,
+                audio,
+                engine,
+                chunker,
+                can_select,
+                can_transcribe,
+            )
+
+            if hasattr(self, "main_page"):
+                page = self.main_page
+
+                if hasattr(page, "select_audio_button"):
+                    page.select_audio_button.setEnabled(
+                        can_select
+                    )
+
+                if hasattr(page, "transcribe_button"):
+                    page.transcribe_button.setEnabled(
+                        can_transcribe
+                    )
+
+                if hasattr(page, "load_model_button"):
+                    page.load_model_button.setEnabled(
+                        not processing and not recording
+                    )
+
+                if hasattr(page, "unload_model_button"):
+                    page.unload_model_button.setEnabled(
+                        not processing
+                        and not recording
+                        and loaded
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to refresh controls."
+            )
+
+    # ============================================================
+    # AUDIO SELECTION
+    # ============================================================
+
+    def select_audio(self):
+        if self.processing:
+            return
+
+        try:
+            from PySide6.QtWidgets import QFileDialog
+
+            config = self.load_config()
+            input_dir = self.get_input_dir(config)
+
+            file_filter = (
+                "Audio Files (*.wav *.mp3 *.flac *.m4a *.ogg);;"
+                "WAV Files (*.wav);;"
+                "MP3 Files (*.mp3);;"
+                "FLAC Files (*.flac);;"
+                "M4A Files (*.m4a);;"
+                "OGG Files (*.ogg);;"
+                "All Files (*)"
+            )
+
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                self.TEXT.get(
+                    "select_audio_title",
+                    "Select Audio File",
+                ),
+                str(input_dir),
+                file_filter,
+            )
+
+            if not path:
+                return
+
+            audio_path = Path(path)
+
+            self.logger.info(
+                "Audio selected: %s",
+                audio_path,
+            )
+
+            self.current_audio = audio_path
+            self.current_result = None
+
+            self.current_output_txt = None
+            self.current_output_json = None
+
+            if hasattr(self, "main_page"):
+                page = self.main_page
+
+                if hasattr(page, "set_audio_path"):
+                    page.set_audio_path(str(audio_path))
+
+                if hasattr(page, "transcription_text"):
+                    page.transcription_text.clear()
+
+            self.logger.info(
+                "Audio state updated: current_audio=%s",
+                self.current_audio,
+            )
+
+            self.refresh_controls()
+
+        except Exception:
+            self.logger.exception(
+                "Failed to select audio."
+            )
+
+    # ============================================================
+    # MODEL LOADING
+    # ============================================================
+
     def load_model(self):
-
-        if (
-            self.processing
-            or self.recording
-        ):
+        if self.processing:
             return
 
-        model_name = (
-            self.model_var.get().strip()
-        )
-
-        if not model_name:
-
-            messagebox.showwarning(
-                TEXTS[self.language]["warning"],
-                TEXTS[self.language]["select_model"],
+        if self.model_loaded:
+            self.logger.info(
+                "Model is already loaded."
             )
-
-            return
-
-        engine_class = ENGINE_REGISTRY.get(
-            model_name
-        )
-
-        if engine_class is None:
-
-            messagebox.showerror(
-                TEXTS[self.language]["error"],
-                f"Unknown model: {model_name}",
-            )
-
             return
 
         self.processing = True
-        self.operation = "loading"
+        self.status_key = "loading_model"
+        self.status_detail = ""
 
-        self.set_status(
-            "loading"
+        self.logger.info(
+            "MODEL | loading started | model=%s",
+            self.model_var,
         )
-
-        self.progress_var.set(0)
-        self.progress_text_var.set("")
 
         self.refresh_controls()
 
-        self.logger.info(
-            "Selected engine: %s",
-            model_name,
-        )
+        try:
+            if hasattr(self, "main_page"):
+                if hasattr(
+                    self.main_page,
+                    "set_model_loading",
+                ):
+                    self.main_page.set_model_loading(True)
+
+                if hasattr(
+                    self.main_page,
+                    "set_processing_running",
+                ):
+                    self.main_page.set_processing_running(
+                        True
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to update model loading UI."
+            )
+
+        import threading
 
         thread = threading.Thread(
             target=self._load_model_worker,
-            args=(
-                model_name,
-                engine_class,
-            ),
+            name="ASR-Model-Loader",
             daemon=True,
         )
 
+        self.operation = thread
         thread.start()
 
-    def _load_model_worker(
-        self,
-        model_name,
-        engine_class,
-    ):
+    def _load_model_worker(self):
+        start_time = time.perf_counter()
 
         engine = None
+        pipeline = None
 
         try:
-
             config = self.load_config()
 
-            model_config = config.get(
-                "model",
-                {},
-            )
-
-            configured_model_name = config.get(
+            engine_name = config.get(
                 "engine",
                 {},
             ).get(
-                "name"
+                "name",
+                "whisper_persian_v4",
             )
 
-            if configured_model_name:
-                if configured_model_name != model_name:
-                    raise ValueError(
-                        "Selected model does not match "
-                        "engine.name in config.yaml."
-                    )
+            if engine_name not in ENGINE_REGISTRY:
+                raise ValueError(
+                    f"Unsupported engine: {engine_name}"
+                )
 
-            model_path = (
-                PROJECT_ROOT
-                / model_config.get(
+            model_path = self._resolve_project_path(
+                config.get("model", {}).get(
                     "path",
-                    "",
+                    "models/whisper_persian_v4",
                 )
             )
 
@@ -138,1671 +357,1158 @@ class UIOperationsMixin:
 
             if not model_path.exists():
                 raise FileNotFoundError(
-                    f"Model directory not found: {model_path}"
+                    f"Model directory not found: "
+                    f"{model_path}"
                 )
-
-            load_start = time.perf_counter()
-
-            engine = engine_class(
-                config
-            )
 
             self.logger.info(
                 "Loading engine..."
             )
 
+            engine_class = ENGINE_REGISTRY[
+                engine_name
+            ]
+
+            engine = engine_class(config)
+
             engine.load()
 
-            load_time = (
-                time.perf_counter()
-                - load_start
-            )
-
-            chunker = AudioChunker(
-                config
-            )
-
-            self.engine = engine
-            self.chunker = chunker
-            self.model_loaded = True
+            elapsed = time.perf_counter() - start_time
 
             self.logger.info(
                 "Engine loaded successfully in %.3f sec.",
-                load_time,
+                elapsed,
             )
 
-            self.root.after(
-                0,
-                self._model_loaded_ui,
+            # ----------------------------------------------------
+            # IMPORTANT:
+            # The UI now uses the exact same MeetingPipeline
+            # architecture as the non-UI main runner.
+            # ----------------------------------------------------
+
+            self.logger.info(
+                "Loading MeetingPipeline..."
             )
 
-        except Exception:
+            pipeline = MeetingPipeline(
+                config,
+                engine,
+            )
 
-            if engine is not None:
-                try:
+            pipeline.load()
+
+            pipeline_elapsed = (
+                time.perf_counter() - start_time
+            )
+
+            self.logger.info(
+                "MeetingPipeline loaded successfully "
+                "in %.3f sec.",
+                pipeline_elapsed,
+            )
+
+            self.ui_call(
+                lambda e=engine, p=pipeline:
+                self._model_loaded_ui(e, p)
+            )
+
+        except Exception as exc:
+            self.logger.exception(
+                "Failed to load model."
+            )
+
+            try:
+                if pipeline is not None:
+                    pipeline.unload()
+            except Exception:
+                self.logger.exception(
+                    "Failed to unload partially loaded "
+                    "MeetingPipeline."
+                )
+
+            try:
+                if engine is not None:
                     engine.unload()
-                except Exception:
-                    pass
+            except Exception:
+                self.logger.exception(
+                    "Failed to unload partially loaded engine."
+                )
 
-            self.logger.exception(
-                "Model loading failed."
+            self.ui_call(
+                lambda error=exc:
+                self._model_load_failed_ui(error)
             )
 
-            self.root.after(
-                0,
-                self._model_load_failed_ui,
-            )
+    def _model_loaded_ui(self, engine, pipeline):
+        self.engine = engine
+        self.pipeline = pipeline
 
-    def _model_loaded_ui(self):
+        # MeetingPipeline already owns the chunker.
+        # Keep the reference only for UI compatibility.
+        self.chunker = getattr(
+            pipeline,
+            "chunker",
+            None,
+        )
 
+        self.model_loaded = True
         self.processing = False
-        self.operation = None
-
-        self.progress_var.set(100)
-
-        self.set_status(
-            "loaded"
-        )
-
-        self.refresh_controls()
-
-    def _model_load_failed_ui(self):
-
-        self.processing = False
-        self.operation = None
-        self.model_loaded = False
-
-        self.engine = None
-        self.chunker = None
-
-        self.set_status(
-            "error"
-        )
-
-        self.refresh_controls()
-
-        messagebox.showerror(
-            TEXTS[self.language]["error"],
-            TEXTS[self.language]["model_load_failed"],
-        )
-
-    def unload_model(self):
-
-        if (
-            self.processing
-            or self.recording
-        ):
-            return
-
-        if not self.model_loaded:
-            return
-
-        self.processing = True
-        self.operation = "unloading"
-
-        self.set_status(
-            "unloading"
-        )
-
-        self.progress_var.set(0)
-
-        self.refresh_controls()
+        self.status_key = "model_loaded"
+        self.status_detail = ""
 
         self.logger.info(
-            "Unloading engine..."
-        )
-
-        thread = threading.Thread(
-            target=self._unload_model_worker,
-            daemon=True,
-        )
-
-        thread.start()
-
-    def _unload_model_worker(self):
-
-        try:
-
-            if self.engine is not None:
-                self.engine.unload()
-
-            self.engine = None
-            self.chunker = None
-            self.model_loaded = False
-
-            self.logger.info(
-                "Engine unloaded."
-            )
-
-            self.root.after(
-                0,
-                self._model_unloaded_ui,
-            )
-
-        except Exception:
-
-            self.logger.exception(
-                "Engine unload failed."
-            )
-
-            self.root.after(
-                0,
-                self._model_unload_failed_ui,
-            )
-
-    def _model_unloaded_ui(self):
-
-        self.processing = False
-        self.operation = None
-
-        self.set_status(
-            "unloaded"
-        )
-
-        self.refresh_controls()
-
-    def _model_unload_failed_ui(self):
-
-        self.processing = False
-        self.operation = None
-
-        self.set_status(
-            "error"
-        )
-
-        self.refresh_controls()
-
-    def select_audio(self):
-
-        if (
-            self.processing
-            or self.recording
-        ):
-            return
-
-        try:
-            config = self.load_config()
-            input_dir = self.get_input_dir(config)
-        except Exception:
-            input_dir = DEFAULT_INPUT_DIR
-
-        t = TEXTS[self.language]
-
-        path = filedialog.askopenfilename(
-            title=t["open_audio"],
-            initialdir=str(input_dir),
-            filetypes=[
-                (
-                    t["audio_files"],
-                    "*.wav *.mp3 *.flac *.m4a *.ogg *.aac",
-                ),
-                (
-                    t["all_files"],
-                    "*.*",
-                ),
-            ],
-        )
-
-        if not path:
-            return
-
-        self.current_audio = Path(path)
-
-        self.audio_var.set(
-            str(self.current_audio)
-        )
-
-        self.current_result = None
-
-        self.transcription_text.delete(
-            "1.0",
-            "end",
-        )
-
-        tag = (
-            "rtl"
-            if self.language == "fa"
-            else "ltr"
-        )
-
-        self.transcription_text.insert(
-            "1.0",
-            t["no_transcription"],
-            tag,
-        )
-
-        self.set_status(
-            "loaded"
-            if self.model_loaded
-            else "ready"
-        )
-
-        self.refresh_controls()
-
-        self.logger.info(
-            "Audio selected: %s",
-            self.current_audio,
-        )
-
-    def start_recording(self):
-
-        if (
-            self.processing
-            or self.recording
-        ):
-            return
-
-        try:
-
-            config = self.load_config()
-
-            sample_rate = int(
-                config.get(
-                    "audio",
-                    {},
-                ).get(
-                    "sample_rate",
-                    16000,
-                )
-            )
-
-            self.recorder = AudioRecorder(
-                sample_rate=sample_rate,
-                channels=1,
-                dtype="float32",
-            )
-
-            self.recorder.start()
-
-            self.recording = True
-            self.operation = "recording"
-
-            self.set_status(
-                "recording"
-            )
-
-            self.refresh_controls()
-
-            self.logger.info(
-                "Recording started."
-            )
-
-        except Exception:
-
-            self.logger.exception(
-                "Recording failed to start."
-            )
-
-            self.recording = False
-            self.operation = None
-
-            self.set_status(
-                "error"
-            )
-
-            self.refresh_controls()
-
-    def stop_recording(self):
-
-        if not self.recording:
-            return
-
-        try:
-
-            output_path = (
-                self.recorder.generate_output_path(
-                    RECORDINGS_DIR
-                )
-            )
-
-            self.recorder.stop(
-                output_path
-            )
-
-            self.current_audio = Path(
-                output_path
-            )
-
-            self.audio_var.set(
-                str(self.current_audio)
-            )
-
-            self.current_result = None
-
-            self.transcription_text.delete(
-                "1.0",
-                "end",
-            )
-
-            self.transcription_text.insert(
-                "1.0",
-                TEXTS[self.language][
-                    "no_transcription"
-                ],
-                (
-                    "rtl"
-                    if self.language == "fa"
-                    else "ltr"
-                ),
-            )
-
-            self.logger.info(
-                "Recording saved: %s",
-                output_path,
-            )
-
-            self.recording = False
-            self.operation = None
-
-            self.set_status(
-                "recording_saved"
-            )
-
-        except Exception:
-
-            self.logger.exception(
-                "Failed to stop recording."
-            )
-
-            self.recording = False
-            self.operation = None
-
-            self.set_status(
-                "error"
-            )
-
-        finally:
-
-            self.recorder = None
-            self.refresh_controls()
-
-    def transcribe(self):
-
-        if (
-            self.processing
-            or self.recording
-        ):
-            return
-
-        if (
-            not self.model_loaded
-            or self.engine is None
-            or self.chunker is None
-        ):
-
-            messagebox.showwarning(
-                TEXTS[self.language]["warning"],
-                TEXTS[self.language]["load_model_first"],
-            )
-
-            return
-
-        if not self.current_audio:
-
-            messagebox.showwarning(
-                TEXTS[self.language]["warning"],
-                TEXTS[self.language]["select_audio_first"],
-            )
-
-            return
-
-        audio_path = self.current_audio
-        engine = self.engine
-        chunker = self.chunker
-
-        self.processing = True
-        self.operation = "processing"
-
-        self.current_result = None
-
-        self.progress_var.set(0)
-        self.progress_text_var.set("")
-
-        self.transcription_text.delete(
-            "1.0",
-            "end",
-        )
-
-        self.transcription_text.insert(
-            "1.0",
-            TEXTS[self.language]["processing"],
-            (
-                "rtl"
-                if self.language == "fa"
-                else "ltr"
+            "MODEL | UI updated | model_loaded=%s | "
+            "current_audio=%s",
+            self.model_loaded,
+            getattr(
+                self,
+                "current_audio",
+                None,
             ),
         )
 
-        self.set_status(
-            "processing"
+        try:
+            if hasattr(self, "main_page"):
+                if hasattr(
+                    self.main_page,
+                    "set_model_loading",
+                ):
+                    self.main_page.set_model_loading(
+                        False
+                    )
+
+                if hasattr(
+                    self.main_page,
+                    "set_processing_running",
+                ):
+                    self.main_page.set_processing_running(
+                        False
+                    )
+
+                if hasattr(
+                    self.main_page,
+                    "set_processing_success",
+                ):
+                    self.main_page.set_processing_success(
+                        "مدل و موتور پردازش جلسه آماده است."
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to update model-loaded UI."
+            )
+
+        self.refresh_controls()
+
+    def _model_load_failed_ui(self, error):
+        self.engine = None
+        self.pipeline = None
+        self.chunker = None
+
+        self.model_loaded = False
+        self.processing = False
+        self.status_key = "model_load_failed"
+        self.status_detail = str(error)
+
+        try:
+            if hasattr(self, "main_page"):
+                if hasattr(
+                    self.main_page,
+                    "set_model_loading",
+                ):
+                    self.main_page.set_model_loading(
+                        False
+                    )
+
+                if hasattr(
+                    self.main_page,
+                    "set_processing_running",
+                ):
+                    self.main_page.set_processing_running(
+                        False
+                    )
+
+                if hasattr(
+                    self.main_page,
+                    "set_processing_error",
+                ):
+                    self.main_page.set_processing_error(
+                        str(error)
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to update model-load error UI."
+            )
+
+        self.refresh_controls()
+
+    # ============================================================
+    # MODEL UNLOADING
+    # ============================================================
+
+    def unload_model(self):
+        if self.processing:
+            return
+
+        pipeline = getattr(
+            self,
+            "pipeline",
+            None,
+        )
+
+        engine = getattr(
+            self,
+            "engine",
+            None,
+        )
+
+        if pipeline is None and engine is None:
+            self.model_loaded = False
+            self.chunker = None
+            self.refresh_controls()
+            return
+
+        self.processing = True
+
+        self.logger.info(
+            "MODEL | unloading started"
         )
 
         self.refresh_controls()
+
+        import threading
+
+        thread = threading.Thread(
+            target=self._unload_model_worker,
+            args=(pipeline, engine),
+            name="ASR-Model-Unloader",
+            daemon=True,
+        )
+
+        self.operation = thread
+        thread.start()
+
+    def _unload_model_worker(
+        self,
+        pipeline,
+        engine,
+    ):
+        try:
+            # MeetingPipeline unloads diarization,
+            # overlap separation and related resources.
+            if pipeline is not None:
+                self.logger.info(
+                    "Unloading MeetingPipeline..."
+                )
+                pipeline.unload()
+
+            # Whisper engine is owned outside the pipeline.
+            if engine is not None:
+                self.logger.info(
+                    "Unloading Whisper engine..."
+                )
+                engine.unload()
+
+            self.ui_call(
+                self._model_unloaded_ui
+            )
+
+        except Exception as exc:
+            self.logger.exception(
+                "Failed to unload model."
+            )
+
+            self.ui_call(
+                lambda error=exc:
+                self._model_unload_failed_ui(error)
+            )
+
+    def _model_unloaded_ui(self):
+        self.pipeline = None
+        self.engine = None
+        self.chunker = None
+
+        self.model_loaded = False
+        self.processing = False
+
+        self.logger.info(
+            "MODEL | unloaded"
+        )
+
+        try:
+            if hasattr(self, "main_page"):
+                if hasattr(
+                    self.main_page,
+                    "set_processing_success",
+                ):
+                    self.main_page.set_processing_success(
+                        "مدل آزاد شد."
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to update unload UI."
+            )
+
+        self.refresh_controls()
+
+    def _model_unload_failed_ui(self, error):
+        self.processing = False
+
+        self.logger.error(
+            "MODEL | unload failed | %s",
+            error,
+        )
+
+        try:
+            if hasattr(self, "main_page"):
+                if hasattr(
+                    self.main_page,
+                    "set_processing_error",
+                ):
+                    self.main_page.set_processing_error(
+                        str(error)
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to update unload error UI."
+            )
+
+        self.refresh_controls()
+
+    # ============================================================
+    # TRANSCRIPTION
+    # ============================================================
+
+    def transcribe(self):
+        if self.processing:
+            return
+
+        audio_path = getattr(
+            self,
+            "current_audio",
+            None,
+        )
+
+        pipeline = getattr(
+            self,
+            "pipeline",
+            None,
+        )
+
+        if not self.model_loaded:
+            self.logger.warning(
+                "Cannot transcribe: model is not loaded."
+            )
+            return
+
+        if pipeline is None:
+            self.logger.error(
+                "Cannot transcribe: MeetingPipeline "
+                "is not loaded."
+            )
+            return
+
+        if audio_path is None:
+            self.logger.warning(
+                "Cannot transcribe: no audio selected."
+            )
+            return
+
+        audio_path = Path(audio_path)
+
+        if not audio_path.exists():
+            self.logger.error(
+                "Audio file does not exist: %s",
+                audio_path,
+            )
+            return
+
+        self.processing = True
+        self.status_key = "processing"
+        self.status_detail = ""
 
         self.logger.info(
             "Starting transcription: %s",
             audio_path,
         )
 
+        self.refresh_controls()
+
+        try:
+            if hasattr(self, "main_page"):
+                if hasattr(
+                    self.main_page,
+                    "set_processing_running",
+                ):
+                    self.main_page.set_processing_running(
+                        True
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to update transcription UI."
+            )
+
+        import threading
+
         thread = threading.Thread(
             target=self._transcription_worker,
             args=(
                 audio_path,
-                engine,
-                chunker,
+                pipeline,
             ),
+            name="Meeting-Transcription",
             daemon=True,
         )
 
+        self.operation = thread
         thread.start()
 
     def _transcription_worker(
         self,
         audio_path: Path,
-        engine,
-        chunker,
+        pipeline: MeetingPipeline,
     ):
-
-        file_start_time = time.perf_counter()
+        started = time.perf_counter()
 
         try:
-
-            self.logger.info(
-                "Analyzing audio and creating chunks..."
-            )
-
-            chunks = chunker.chunk_file(
-                audio_path
-            )
-
-            if not chunks:
-                raise RuntimeError(
-                    "No audio chunks were created."
-                )
-
-            total = len(chunks)
-
-            self.logger.info(
-                "Created %d chunk(s) from %s",
-                total,
-                audio_path.name,
-            )
-
-            for chunk in chunks:
-
-                self.logger.info(
-                    "Chunk %03d | %s -> %s | %.2f sec",
-                    chunk.index,
-                    format_seconds(chunk.start),
-                    format_seconds(chunk.end),
-                    chunk.duration,
-                )
-
-            self.root.after(
-                0,
-                lambda:
-                self._prepare_progress_ui(
-                    total
-                ),
-            )
-
-            chunk_results = []
-            texts = []
-
-            total_audio_duration = 0.0
-            total_inference_time = 0.0
-
-            self.logger.info(
-                "Starting transcription..."
-            )
-
-            for position, chunk in enumerate(
-                chunks,
-                start=1,
-            ):
-
-                elapsed = (
-                    time.perf_counter()
-                    - file_start_time
-                )
-
-                operation_text = (
-                    f"{TEXTS[self.language]['processing_chunk']} "
-                    f"{position} / {total}"
-                )
-
-                self.root.after(
-                    0,
-                    lambda
-                    op=operation_text,
-                    i=position,
-                    total_chunks=total,
-                    e=elapsed:
-                    self._update_processing_ui(
-                        op,
-                        i,
-                        total_chunks,
-                        e,
-                    ),
-                )
-
-                self.logger.info(
-                    "[%d/%d] Transcribing chunk %03d...",
-                    position,
-                    total,
-                    chunk.index,
-                )
-
-                inference_start = (
-                    time.perf_counter()
-                )
-
-                raw_result = engine.transcribe(
-                    chunk.audio,
-                    sample_rate=chunker.sample_rate,
-                )
-
-                inference_time = (
-                    time.perf_counter()
-                    - inference_start
-                )
-
-                if isinstance(
-                    raw_result,
-                    dict,
-                ):
-                    text = str(
-                        raw_result.get(
-                            "text",
-                            "",
-                        )
-                    ).strip()
-
-                else:
-                    text = str(
-                        raw_result or ""
-                    ).strip()
-
-                chunk_duration = float(
-                    chunk.duration
-                )
-
-                total_audio_duration += (
-                    chunk_duration
-                )
-
-                total_inference_time += (
-                    inference_time
-                )
-
-                if text:
-                    texts.append(text)
-
-                rtf = (
-                    inference_time
-                    / chunk_duration
-                    if chunk_duration > 0
-                    else None
-                )
-
-                realtime_factor = (
-                    chunk_duration
-                    / inference_time
-                    if inference_time > 0
-                    else None
-                )
-
-                chunk_result = {
-                    "index": int(
-                        chunk.index
-                    ),
-                    "start": round(
-                        float(chunk.start),
-                        3,
-                    ),
-                    "end": round(
-                        float(chunk.end),
-                        3,
-                    ),
-                    "duration": round(
-                        chunk_duration,
-                        3,
-                    ),
-                    "inference_time": round(
-                        inference_time,
-                        3,
-                    ),
-                    "rtf": round(
-                        rtf,
-                        6,
-                    )
-                    if rtf is not None
-                    else None,
-                    "realtime_factor": round(
-                        realtime_factor,
-                        3,
-                    )
-                    if realtime_factor is not None
-                    else None,
-                    "text": text,
-                }
-
-                chunk_results.append(
-                    chunk_result
-                )
-
-                self.logger.info(
-                    "Chunk %03d completed | "
-                    "audio=%.2fs | "
-                    "inference=%.2fs | "
-                    "RTF=%.3f",
-                    chunk.index,
-                    chunk_duration,
-                    inference_time,
-                    (
-                        rtf
-                        if rtf is not None
-                        else 0.0
-                    ),
-                )
-
-                if text:
-                    self.logger.info(
-                        "Text: %s",
-                        text,
-                    )
-                else:
-                    self.logger.info(
-                        "Text: [empty]"
-                    )
-
-            final_text = " ".join(
-                text.strip()
-                for text in texts
-                if text and text.strip()
-            ).strip()
-
-            file_processing_time = (
-                time.perf_counter()
-                - file_start_time
-            )
-
-            overall_rtf = (
-                total_inference_time
-                / total_audio_duration
-                if total_audio_duration > 0
-                else None
-            )
-
-            overall_realtime_factor = (
-                total_audio_duration
-                / total_inference_time
-                if total_inference_time > 0
-                else None
-            )
-
             config = self.load_config()
 
             output_dir = self.get_output_dir(
                 config
             )
 
+            # ----------------------------------------------------
+            # EXACT SAME OUTPUT STRUCTURE AS NON-UI MAIN
+            #
+            # output/
+            #   test/
+            #       test_meeting.txt
+            #       test_meeting.json
+            #       ...
+            # ----------------------------------------------------
+
+            file_output_dir = (
+                output_dir / audio_path.stem
+            )
+
+            file_output_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            self.logger.info(
+                "Meeting output directory: %s",
+                file_output_dir,
+            )
+
+            self.logger.info(
+                "Running MeetingPipeline.process()..."
+            )
+
+            result = pipeline.process(
+                audio_path,
+                file_output_dir,
+            )
+
+            elapsed = (
+                time.perf_counter() - started
+            )
+
             txt_path = (
-                output_dir
-                / f"{audio_path.stem}.txt"
+                file_output_dir
+                / f"{audio_path.stem}_meeting.txt"
             )
 
             json_path = (
-                output_dir
-                / f"{audio_path.stem}.json"
+                file_output_dir
+                / f"{audio_path.stem}_meeting.json"
             )
 
-            output_config = config.get(
-                "output",
-                {},
-            )
-
-            save_txt = output_config.get(
-                "save_txt",
-                True,
-            )
-
-            save_json = output_config.get(
-                "save_json",
-                True,
-            )
-
-            if save_txt:
-
-                txt_path.write_text(
-                    final_text + "\n",
-                    encoding="utf-8",
+            if not txt_path.exists():
+                raise FileNotFoundError(
+                    "MeetingPipeline completed but the "
+                    f"expected TXT file was not created:\n"
+                    f"{txt_path}"
                 )
 
-                self.logger.info(
-                    "TXT saved: %s",
+            # ----------------------------------------------------
+            # IMPORTANT:
+            # Never reconstruct the displayed transcript
+            # from plain Whisper text.
+            #
+            # Read the exact TXT generated by MeetingPipeline.
+            # ----------------------------------------------------
+
+            meeting_text = txt_path.read_text(
+                encoding="utf-8"
+            )
+
+            if not meeting_text.strip():
+                self.logger.warning(
+                    "Meeting TXT is empty: %s",
                     txt_path,
                 )
 
-            if save_json:
+            self.logger.info(
+                "MeetingPipeline completed in %.3f sec.",
+                elapsed,
+            )
 
-                model_path = (
-                    PROJECT_ROOT
-                    / config.get(
-                        "model",
-                        {},
-                    ).get(
-                        "path",
-                        "",
-                    )
-                )
+            self.logger.info(
+                "Meeting TXT: %s",
+                txt_path,
+            )
 
-                json_data = {
-                    "file": {
-                        "name": audio_path.name,
-                        "path": str(
-                            audio_path
-                        ),
-                        "extension": (
-                            audio_path.suffix.lower()
-                        ),
-                    },
-
-                    "engine": {
-                        "name": config.get(
-                            "engine",
-                            {},
-                        ).get(
-                            "name"
-                        ),
-                        "model_path": str(
-                            model_path
-                        ),
-                    },
-
-                    "audio": {
-                        "sample_rate": (
-                            chunker.sample_rate
-                        ),
-                        "language": config.get(
-                            "audio",
-                            {},
-                        ).get(
-                            "language",
-                            "fa",
-                        ),
-                        "task": config.get(
-                            "audio",
-                            {},
-                        ).get(
-                            "task",
-                            "transcribe",
-                        ),
-                        "duration": round(
-                            total_audio_duration,
-                            3,
-                        ),
-                    },
-
-                    "processing": {
-                        "chunks": len(
-                            chunks
-                        ),
-                        "inference_time": round(
-                            total_inference_time,
-                            3,
-                        ),
-                        "total_processing_time": round(
-                            file_processing_time,
-                            3,
-                        ),
-                        "rtf": round(
-                            overall_rtf,
-                            6,
-                        )
-                        if overall_rtf is not None
-                        else None,
-                        "realtime_factor": round(
-                            overall_realtime_factor,
-                            3,
-                        )
-                        if overall_realtime_factor is not None
-                        else None,
-                    },
-
-                    "transcription": {
-                        "text": final_text,
-                    },
-
-                    "chunks": chunk_results,
-                }
-
-                json_path.write_text(
-                    json.dumps(
-                        json_data,
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-
+            if json_path.exists():
                 self.logger.info(
-                    "JSON saved: %s",
+                    "Meeting JSON: %s",
                     json_path,
                 )
 
-            self.logger.info("")
-            self.logger.info(
-                "-" * 60
-            )
-
-            self.logger.info(
-                "FILE COMPLETED"
-            )
-
-            self.logger.info(
-                "File       : %s",
-                audio_path.name,
-            )
-
-            self.logger.info(
-                "Audio      : %.2f sec",
-                total_audio_duration,
-            )
-
-            self.logger.info(
-                "Chunks     : %d",
-                len(chunks),
-            )
-
-            self.logger.info(
-                "Inference  : %.2f sec",
-                total_inference_time,
-            )
-
-            self.logger.info(
-                "Total time : %.2f sec",
-                file_processing_time,
-            )
-
-            if overall_rtf is not None:
-                self.logger.info(
-                    "RTF        : %.3f",
-                    overall_rtf,
-                )
-
-            if overall_realtime_factor is not None:
-                self.logger.info(
-                    "Realtime   : %.2fx",
-                    overall_realtime_factor,
-                )
-
-            self.logger.info(
-                "-" * 60
-            )
-
-            result = {
-                "file": {
-                    "name": audio_path.name,
-                    "path": str(audio_path),
-                    "extension": audio_path.suffix.lower(),
-                },
-
-                "engine": {
-                    "name": config.get(
-                        "engine",
-                        {},
-                    ).get(
-                        "name"
-                    ),
-                    "model_path": str(
-                        PROJECT_ROOT
-                        / config.get(
-                            "model",
-                            {},
-                        ).get(
-                            "path",
-                            "",
-                        )
-                    ),
-                },
-
-                "audio": {
-                    "sample_rate": (
-                        chunker.sample_rate
-                    ),
-                    "language": config.get(
-                        "audio",
-                        {},
-                    ).get(
-                        "language",
-                        "fa",
-                    ),
-                    "task": config.get(
-                        "audio",
-                        {},
-                    ).get(
-                        "task",
-                        "transcribe",
-                    ),
-                    "duration": round(
-                        total_audio_duration,
-                        3,
-                    ),
-                },
-
-                "processing": {
-                    "chunks": len(chunks),
-                    "inference_time": round(
-                        total_inference_time,
-                        3,
-                    ),
-                    "total_processing_time": round(
-                        file_processing_time,
-                        3,
-                    ),
-                    "rtf": round(
-                        overall_rtf,
-                        6,
-                    )
-                    if overall_rtf is not None
-                    else None,
-                    "realtime_factor": round(
-                        overall_realtime_factor,
-                        3,
-                    )
-                    if overall_realtime_factor is not None
-                    else None,
-                },
-
-                "transcription": {
-                    "text": final_text,
-                },
-
-                "chunks": chunk_results,
-            }
-
-            self.current_result = result
-
-            self.root.after(
-                0,
-                lambda:
+            self.ui_call(
+                lambda r=result,
+                text=meeting_text,
+                txt=txt_path,
+                js=json_path,
+                elapsed_seconds=elapsed:
                 self._transcription_completed_ui(
-                    final_text,
-                    result,
-                    file_processing_time,
-                ),
+                    r,
+                    text,
+                    txt,
+                    js,
+                    elapsed_seconds,
+                )
             )
 
-        except Exception:
-
+        except Exception as exc:
             self.logger.exception(
                 "Failed processing file: %s",
                 audio_path.name,
             )
 
-            self.root.after(
-                0,
-                self._transcription_failed_ui,
+            self.ui_call(
+                lambda error=exc:
+                self._transcription_failed_ui(
+                    error
+                )
             )
-
-    def _prepare_progress_ui(
-        self,
-        total,
-    ):
-
-        self.progress.configure(
-            mode="determinate",
-            maximum=max(
-                total,
-                1,
-            ),
-        )
-
-        self.progress_var.set(0)
-
-        self.progress_text_var.set(
-            f"0 / {total}"
-        )
-
-    def _update_processing_ui(
-        self,
-        operation,
-        index,
-        total,
-        elapsed,
-    ):
-
-        self.operation_var.set(
-            operation
-        )
-
-        self.progress.configure(
-            maximum=max(
-                total,
-                1,
-            ),
-        )
-
-        self.progress_var.set(
-            index
-        )
-
-        self.progress_text_var.set(
-            f"{index} / {total}  •  "
-            f"{TEXTS[self.language]['elapsed']}: "
-            f"{elapsed:.1f}s"
-        )
 
     def _transcription_completed_ui(
         self,
-        text,
         result,
-        elapsed,
+        meeting_text,
+        txt_path,
+        json_path,
+        elapsed_seconds,
     ):
+        self.current_result = result
+        self.current_output_txt = Path(
+            txt_path
+        )
+
+        self.current_output_json = (
+            Path(json_path)
+            if Path(json_path).exists()
+            else None
+        )
 
         self.processing = False
-        self.operation = None
-
-        total_chunks = result[
-            "processing"
-        ][
-            "chunks"
-        ]
-
-        self.progress_var.set(
-            total_chunks
+        self.status_key = "completed"
+        self.status_detail = (
+            f"{elapsed_seconds:.2f} sec"
         )
 
-        self.progress.configure(
-            maximum=max(
-                total_chunks,
-                1
-            )
-        )
-
-        self.progress_text_var.set(
-            f"{total_chunks} / {total_chunks}"
-        )
-
-        self.transcription_text.delete(
-            "1.0",
-            "end",
-        )
-
-        tag = (
-            "rtl"
-            if self.language == "fa"
-            else "ltr"
-        )
-
-        self.transcription_text.insert(
-            "1.0",
-            (
-                text
-                or TEXTS[self.language][
-                    "no_transcription"
-                ]
-            ),
-            tag,
-        )
-
-        self.set_status(
-            "completed",
-            (
-                f"{TEXTS[self.language]['elapsed']}: "
-                f"{elapsed:.2f}s"
-            ),
-        )
-
-        self.refresh_controls()
-
-    def _transcription_failed_ui(self):
-
-        self.processing = False
-        self.operation = None
-
-        self.set_status(
-            "error"
-        )
-
-        self.transcription_text.delete(
-            "1.0",
-            "end",
-        )
-
-        self.transcription_text.insert(
-            "1.0",
-            TEXTS[self.language][
-                "transcription_failed"
-            ],
-            (
-                "rtl"
-                if self.language == "fa"
-                else "ltr"
-            ),
-        )
-
-        self.refresh_controls()
-
-        messagebox.showerror(
-            TEXTS[self.language]["error"],
-            TEXTS[self.language][
-                "transcription_failed"
-            ],
-        )
-
-    def export_txt(self):
-
-        if not self.current_result:
-            return
-
-        text = (
-            self.current_result.get(
-                "transcription",
-                {},
-            )
-        )
-
-        if isinstance(text, dict):
-            text = text.get(
-                "text",
-                "",
-            )
-
-        default_name = (
-            Path(
-                self.current_result.get(
-                    "file",
-                    {},
-                ).get(
-                    "name",
-                    "transcription",
-                )
-                if isinstance(
-                    self.current_result.get(
-                        "file"
-                    ),
-                    dict,
-                )
-                else self.current_result.get(
-                    "file",
-                    "transcription",
-                )
-            ).stem
-            + ".txt"
-        )
-
-        path = filedialog.asksaveasfilename(
-            title=TEXTS[self.language][
-                "export_txt"
-            ],
-            initialdir=str(
-                DEFAULT_OUTPUT_DIR
-            ),
-            initialfile=default_name,
-            defaultextension=".txt",
-            filetypes=[
-                (
-                    "TXT",
-                    "*.txt",
-                ),
-            ],
-        )
-
-        if not path:
-            return
-
-        Path(path).write_text(
-            str(text),
-            encoding="utf-8",
-        )
-
-        self.logger.info(
-            "TXT exported: %s",
-            path,
-        )
-
-        messagebox.showinfo(
-            TEXTS[self.language]["success"],
-            (
-                f"{TEXTS[self.language]['saved_txt']}\n"
-                f"{path}"
-            ),
-        )
-
-    def export_json(self):
-
-        if not self.current_result:
-            return
-
-        file_data = self.current_result.get(
-            "file",
-            {},
-        )
-
-        if isinstance(
-            file_data,
-            dict,
-        ):
-            filename = file_data.get(
-                "name",
-                "transcription",
-            )
-        else:
-            filename = str(
-                file_data
-            )
-
-        default_name = (
-            Path(filename).stem
-            + ".json"
-        )
-
-        path = filedialog.asksaveasfilename(
-            title=TEXTS[self.language][
-                "export_json"
-            ],
-            initialdir=str(
-                DEFAULT_OUTPUT_DIR
-            ),
-            initialfile=default_name,
-            defaultextension=".json",
-            filetypes=[
-                (
-                    "JSON",
-                    "*.json",
-                ),
-            ],
-        )
-
-        if not path:
-            return
-
-        Path(path).write_text(
-            json.dumps(
-                self.current_result,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        self.logger.info(
-            "JSON exported: %s",
-            path,
-        )
-
-        messagebox.showinfo(
-            TEXTS[self.language]["success"],
-            (
-                f"{TEXTS[self.language]['saved_json']}\n"
-                f"{path}"
-            ),
-        )
-
-    def open_output(self):
+        # --------------------------------------------------------
+        # DISPLAY EXACT MEETING TXT
+        # --------------------------------------------------------
 
         try:
+            if hasattr(self, "main_page"):
+                page = self.main_page
 
-            try:
+                if hasattr(
+                    page,
+                    "transcription_text",
+                ):
+                    page.transcription_text.set_text(
+                        meeting_text,
+                        self.language == "fa",
+                    )
+
+                if hasattr(
+                    page,
+                    "set_processing_success",
+                ):
+                    page.set_processing_success(
+                        "پردازش جلسه با موفقیت انجام شد."
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to update transcription result UI."
+            )
+
+        self.logger.info(
+            "Transcription completed successfully."
+        )
+
+        self.logger.info(
+            "Displayed meeting transcript from: %s",
+            txt_path,
+        )
+
+        self.refresh_controls()
+
+    def _transcription_failed_ui(self, error):
+        self.processing = False
+        self.status_key = "processing_failed"
+        self.status_detail = str(error)
+
+        try:
+            if hasattr(self, "main_page"):
+                if hasattr(
+                    self.main_page,
+                    "set_processing_error",
+                ):
+                    self.main_page.set_processing_error(
+                        str(error)
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to update transcription error UI."
+            )
+
+        self.refresh_controls()
+
+    # ============================================================
+    # EXPORT TXT
+    # ============================================================
+
+    def export_txt(self):
+        try:
+            from PySide6.QtWidgets import QFileDialog
+
+            source_path = getattr(
+                self,
+                "current_output_txt",
+                None,
+            )
+
+            audio_path = getattr(
+                self,
+                "current_audio",
+                None,
+            )
+
+            if source_path is None:
+                self.logger.warning(
+                    "No meeting TXT is available."
+                )
+                return
+
+            source_path = Path(source_path)
+
+            if not source_path.exists():
+                self.logger.warning(
+                    "Meeting TXT does not exist: %s",
+                    source_path,
+                )
+                return
+
+            default_name = (
+                f"{audio_path.stem}_meeting.txt"
+                if audio_path
+                else source_path.name
+            )
+
+            destination, _ = (
+                QFileDialog.getSaveFileName(
+                    self,
+                    "Export TXT",
+                    str(
+                        PROJECT_ROOT
+                        / default_name
+                    ),
+                    "Text Files (*.txt);;All Files (*)",
+                )
+            )
+
+            if not destination:
+                return
+
+            shutil.copyfile(
+                source_path,
+                destination,
+            )
+
+            self.logger.info(
+                "TXT exported: %s",
+                destination,
+            )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to export TXT."
+            )
+
+    # ============================================================
+    # EXPORT JSON
+    # ============================================================
+
+    def export_json(self):
+        try:
+            from PySide6.QtWidgets import QFileDialog
+
+            source_path = getattr(
+                self,
+                "current_output_json",
+                None,
+            )
+
+            audio_path = getattr(
+                self,
+                "current_audio",
+                None,
+            )
+
+            if source_path is None:
+                self.logger.warning(
+                    "No meeting JSON is available."
+                )
+                return
+
+            source_path = Path(source_path)
+
+            if not source_path.exists():
+                self.logger.warning(
+                    "Meeting JSON does not exist: %s",
+                    source_path,
+                )
+                return
+
+            default_name = (
+                f"{audio_path.stem}_meeting.json"
+                if audio_path
+                else source_path.name
+            )
+
+            destination, _ = (
+                QFileDialog.getSaveFileName(
+                    self,
+                    "Export JSON",
+                    str(
+                        PROJECT_ROOT
+                        / default_name
+                    ),
+                    "JSON Files (*.json);;All Files (*)",
+                )
+            )
+
+            if not destination:
+                return
+
+            shutil.copyfile(
+                source_path,
+                destination,
+            )
+
+            self.logger.info(
+                "JSON exported: %s",
+                destination,
+            )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to export JSON."
+            )
+
+    # ============================================================
+    # COPY TRANSCRIPTION
+    # ============================================================
+
+    def copy_transcription(self):
+        try:
+            from PySide6.QtWidgets import QApplication
+
+            source_path = getattr(
+                self,
+                "current_output_txt",
+                None,
+            )
+
+            if source_path is not None:
+                source_path = Path(
+                    source_path
+                )
+
+                if source_path.exists():
+                    text = source_path.read_text(
+                        encoding="utf-8"
+                    )
+                else:
+                    text = ""
+            else:
+                text = ""
+
+                if hasattr(
+                    self,
+                    "main_page",
+                ) and hasattr(
+                    self.main_page,
+                    "transcription_text",
+                ):
+                    widget = (
+                        self.main_page
+                        .transcription_text
+                    )
+
+                    if hasattr(
+                        widget,
+                        "get_text",
+                    ):
+                        text = widget.get_text()
+
+                    elif hasattr(
+                        widget,
+                        "toPlainText",
+                    ):
+                        text = widget.toPlainText()
+
+            if not text.strip():
+                self.logger.warning(
+                    "Nothing to copy."
+                )
+                return
+
+            QApplication.clipboard().setText(
+                text
+            )
+
+            self.logger.info(
+                "Meeting transcription copied."
+            )
+
+        except Exception:
+            self.logger.exception(
+                "Failed to copy transcription."
+            )
+
+    # ============================================================
+    # OPEN OUTPUT DIRECTORY
+    # ============================================================
+
+    def open_output(self):
+        try:
+            output_path = getattr(
+                self,
+                "current_output_txt",
+                None,
+            )
+
+            if output_path is not None:
+                output_path = Path(
+                    output_path
+                )
+
+                target = output_path.parent
+
+            else:
                 config = self.load_config()
-                output_dir = self.get_output_dir(
+
+                target = self.get_output_dir(
                     config
                 )
-            except Exception:
-                output_dir = DEFAULT_OUTPUT_DIR
 
-            if os.name == "nt":
-
-                os.startfile(
-                    output_dir
+            if sys.platform.startswith("win"):
+                subprocess.Popen(
+                    ["explorer", str(target)]
                 )
 
             elif sys.platform == "darwin":
-
-                os.system(
-                    f'open "{output_dir}"'
+                subprocess.Popen(
+                    ["open", str(target)]
                 )
 
             else:
-
-                os.system(
-                    f'xdg-open "{output_dir}"'
+                subprocess.Popen(
+                    ["xdg-open", str(target)]
                 )
-
-        except Exception:
-
-            self.logger.exception(
-                "Could not open output directory."
-            )
-
-    # --------------------------------------------------------
-    # Copy complete transcription
-    # --------------------------------------------------------
-
-    def copy_transcription_text(self):
-
-        try:
-
-            text = self.transcription_text.get(
-                "1.0",
-                "end-1c",
-            )
-
-        except tk.TclError:
-
-            return "break"
-
-        if not text:
-            return "break"
-
-        # Normalize line endings.
-        text = text.replace(
-            "\r\n",
-            "\n",
-        ).replace(
-            "\r",
-            "\n",
-        )
-
-        # Remove invisible directional formatting characters
-        # if any were introduced by future RTL handling.
-        directional_chars = (
-            "\u200e",  # LRM
-            "\u200f",  # RLM
-            "\u202a",  # LRE
-            "\u202b",  # RLE
-            "\u202c",  # PDF
-            "\u202d",  # LRO
-            "\u202e",  # RLO
-            "\u2066",  # LRI
-            "\u2067",  # RLI
-            "\u2068",  # FSI
-            "\u2069",  # PDI
-        )
-
-        for char in directional_chars:
-            text = text.replace(
-                char,
-                "",
-            )
-
-        try:
-
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-
-            # Keep clipboard available after the application
-            # remains active.
-            self.root.update()
 
             self.logger.info(
-                "Transcription copied to clipboard."
+                "Opened output directory: %s",
+                target,
             )
 
-        except tk.TclError:
-
+        except Exception:
             self.logger.exception(
-                "Could not copy transcription to clipboard."
+                "Failed to open output directory."
             )
 
-        return "break"
+    # ============================================================
+    # RECORDING
+    # ============================================================
 
-    def process_log_queue(self):
-
-        while True:
-
-            try:
-                message = (
-                    self.log_queue.get_nowait()
-                )
-
-            except queue.Empty:
-                break
-
-            self.insert_log(
-                message
-            )
-
-        try:
-            self.root.after(
-                80,
-                self.process_log_queue,
-            )
-        except tk.TclError:
-            pass
-
-    def insert_log(
-        self,
-        message,
-    ):
-
-        if not message:
+    def start_recording(self):
+        if self.processing or self.recording:
             return
 
-        level = "DEFAULT"
-
-        if re.search(
-            r"\|\s*ERROR\s*\|",
-            message,
-            re.IGNORECASE,
-        ):
-            level = "ERROR"
-
-        elif re.search(
-            r"\|\s*WARNING\s*\|",
-            message,
-            re.IGNORECASE,
-        ):
-            level = "WARNING"
-
-        elif re.search(
-            r"\|\s*DEBUG\s*\|",
-            message,
-            re.IGNORECASE,
-        ):
-            level = "DEBUG"
-
-        elif re.search(
-            r"\|\s*INFO\s*\|",
-            message,
-            re.IGNORECASE,
-        ):
-            level = "INFO"
-
-        self.logs_text.configure(
-            state="normal"
-        )
-
-        self.logs_text.insert(
-            "end",
-            message.rstrip() + "\n",
-            level,
-        )
-
-        self.logs_text.see(
-            "end"
-        )
-
-        self.logs_text.configure(
-            state="disabled"
-        )
-
-    def clear_logs(self):
-
-        self.logs_text.configure(
-            state="normal"
-        )
-
-        self.logs_text.delete(
-            "1.0",
-            "end",
-        )
-
-        self.logs_text.configure(
-            state="disabled"
-        )
-
-    def setup_cursor(
-        self,
-        widget,
-        cursor="arrow",
-    ):
-
         try:
-            widget.configure(
-                cursor=cursor
-            )
-        except tk.TclError:
-            pass
-
-    def setup_button_cursor(
-        self,
-        button,
-    ):
-
-        try:
-            button.configure(
-                cursor="hand2"
-            )
-        except tk.TclError:
-            pass
-
-    def on_close(self):
-
-        if (
-            self.processing
-            or self.recording
-        ):
-
-            answer = messagebox.askyesno(
-                TEXTS[self.language][
-                    "confirm_close_title"
-                ],
-                TEXTS[self.language][
-                    "confirm_close"
-                ],
+            recordings_dir = Path(
+                RECORDINGS_DIR
             )
 
-            if not answer:
-                return
-
-        try:
-
-            if (
-                self.recording
-                and self.recorder
-            ):
-                self.recorder.cancel()
-
-        except Exception:
-            pass
-
-        try:
-
-            if self.engine:
-
-                self.logger.info(
-                    "Unloading engine before exit..."
+            if not recordings_dir.is_absolute():
+                recordings_dir = (
+                    PROJECT_ROOT
+                    / recordings_dir
                 )
 
-                self.engine.unload()
+            recordings_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            self.recorder = AudioRecorder(
+                recordings_dir
+            )
+
+            self.recording = True
+
+            self.logger.info(
+                "Recording started."
+            )
+
+            if hasattr(self, "main_page"):
+                if hasattr(
+                    self.main_page,
+                    "set_recording",
+                ):
+                    self.main_page.set_recording(
+                        True
+                    )
+
+            self.refresh_controls()
+
+            self.recorder.start()
 
         except Exception:
+            self.recording = False
 
             self.logger.exception(
-                "Error while unloading engine during exit."
+                "Failed to start recording."
             )
 
-        self.stop_spinner()
+            self.refresh_controls()
+
+    def stop_recording(self):
+        if not self.recording:
+            return
 
         try:
-            self.root.destroy()
-        except tk.TclError:
+            if self.recorder is None:
+                return
+
+            path = self.recorder.stop()
+
+            self.recording = False
+
+            if path:
+                self.current_audio = Path(
+                    path
+                )
+
+                self.logger.info(
+                    "Recording saved: %s",
+                    self.current_audio,
+                )
+
+                if hasattr(
+                    self,
+                    "main_page",
+                ) and hasattr(
+                    self.main_page,
+                    "set_audio_path",
+                ):
+                    self.main_page.set_audio_path(
+                        str(self.current_audio)
+                    )
+
+            if hasattr(self, "main_page"):
+                if hasattr(
+                    self.main_page,
+                    "set_recording",
+                ):
+                    self.main_page.set_recording(
+                        False
+                    )
+
+            self.refresh_controls()
+
+        except Exception:
+            self.recording = False
+
+            self.logger.exception(
+                "Failed to stop recording."
+            )
+
+            self.refresh_controls()
+
+    # ============================================================
+    # LOG QUEUE
+    # ============================================================
+
+    def process_log_queue(self):
+        try:
+            while True:
+                record = self.log_queue.get_nowait()
+
+                try:
+                    message = (
+                        self.ui_log_handler
+                        .format(record)
+                    )
+                except Exception:
+                    message = record.getMessage()
+
+                if hasattr(
+                    self,
+                    "main_page",
+                ):
+                    page = self.main_page
+
+                    if hasattr(
+                        page,
+                        "append_log",
+                    ):
+                        page.append_log(
+                            message
+                        )
+
+                    elif hasattr(
+                        page,
+                        "log_text",
+                    ):
+                        widget = page.log_text
+
+                        if hasattr(
+                            widget,
+                            "appendPlainText",
+                        ):
+                            widget.appendPlainText(
+                                message
+                            )
+
+                        elif hasattr(
+                            widget,
+                            "append",
+                        ):
+                            widget.append(
+                                message
+                            )
+
+        except queue.Empty:
             pass
 
-    def _select_all_transcription(self, event=None):
+        except Exception:
+            self.logger.exception(
+                "Failed to process UI log queue."
+            )
 
+    # ============================================================
+    # CLEAR LOG
+    # ============================================================
+
+    def clear_logs(self):
         try:
+            if hasattr(
+                self,
+                "main_page",
+            ):
+                page = self.main_page
 
-            self.transcription_text.tag_remove(
-                "sel",
-                "1.0",
-                "end",
+                if hasattr(
+                    page,
+                    "clear_logs",
+                ):
+                    page.clear_logs()
+
+                elif hasattr(
+                    page,
+                    "log_text",
+                ):
+                    widget = page.log_text
+
+                    if hasattr(
+                        widget,
+                        "clear",
+                    ):
+                        widget.clear()
+
+            self.logger.info(
+                "UI logs cleared."
             )
 
-            self.transcription_text.tag_add(
-                "sel",
-                "1.0",
-                "end-1c",
+        except Exception:
+            self.logger.exception(
+                "Failed to clear logs."
             )
 
-            self.transcription_text.mark_set(
-                "insert",
-                "end-1c",
-            )
+    # ============================================================
+    # CLOSE
+    # ============================================================
 
-            self.transcription_text.see(
-                "insert"
-            )
-
-            return "break"
-
-        except tk.TclError:
-
-            return "break"
-
-    def _copy_transcription(self, event=None):
-
+    def on_close(self):
         try:
+            if getattr(
+                self,
+                "recording",
+                False,
+            ):
+                try:
+                    self.stop_recording()
+                except Exception:
+                    self.logger.exception(
+                        "Failed to stop recording during close."
+                    )
 
-            try:
-                text = self.transcription_text.get(
-                    "sel.first",
-                    "sel.last",
-                )
+            if getattr(
+                self,
+                "model_loaded",
+                False,
+            ):
+                try:
+                    self.unload_model()
+                except Exception:
+                    self.logger.exception(
+                        "Failed to unload model during close."
+                    )
 
-            except tk.TclError:
-                text = ""
+            if hasattr(
+                self,
+                "settings",
+            ):
+                try:
+                    if hasattr(
+                        self,
+                        "tabs",
+                    ):
+                        self.settings.data[
+                            "last_tab"
+                        ] = self.tabs.currentIndex()
 
-            if not text:
-                return "break"
+                    self.settings.save()
 
-            text = text.replace(
-                "\r\n",
-                "\n",
-            ).replace(
-                "\r",
-                "\n",
+                except Exception:
+                    self.logger.exception(
+                        "Failed to save UI settings."
+                    )
+
+        except Exception:
+            self.logger.exception(
+                "Error during application close."
             )
-
-            directional_chars = (
-                "\u200e",
-                "\u200f",
-                "\u202a",
-                "\u202b",
-                "\u202c",
-                "\u202d",
-                "\u202e",
-                "\u2066",
-                "\u2067",
-                "\u2068",
-                "\u2069",
-            )
-
-            for char in directional_chars:
-                text = text.replace(
-                    char,
-                    "",
-                )
-
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-            self.root.update()
-
-            return "break"
-
-        except tk.TclError:
-
-            return "break"

@@ -1,33 +1,26 @@
-
 from __future__ import annotations
 
 import json
 import logging
 import os
 import sys
-import time
 import threading
-
+import time
 from pathlib import Path
 
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import (
-    QFileDialog,
-    QMessageBox,
-)
+from PySide6.QtWidgets import QFileDialog, QMessageBox
 
-from engines.audio_chunker import AudioChunker
+from pipeline.meeting_pipeline import MeetingPipeline
 from ui.recorder import AudioRecorder
 
 from .ui_constants import (
-    CONFIG_PATH,
     DEFAULT_INPUT_DIR,
     DEFAULT_OUTPUT_DIR,
     ENGINE_REGISTRY,
     PROJECT_ROOT,
     RECORDINGS_DIR,
     TEXTS,
-    format_seconds,
 )
 
 
@@ -48,7 +41,6 @@ class UIOperationsMixin:
             return
 
         self.ui_bridge.signal.emit(fn)
-
 
     # ========================================================
     # Model loading
@@ -81,10 +73,6 @@ class UIOperationsMixin:
                 f"Unknown model: {model_name}",
             )
 
-        # ----------------------------------------------------
-        # Processing state
-        # ----------------------------------------------------
-
         self.processing = True
         self.operation = "loading"
 
@@ -93,25 +81,16 @@ class UIOperationsMixin:
             model_name,
         )
 
-        # ----------------------------------------------------
-        # MainPage processing UI
-        # ----------------------------------------------------
-
         try:
             self.main_page.set_processing_running(
                 "در حال بارگذاری مدل...",
                 indeterminate=True,
             )
         except Exception:
-            # Compatibility with older MainPage
             self.set_status("loading")
             self.set_progress(0, "")
 
         self.refresh_controls()
-
-        # ----------------------------------------------------
-        # Start worker
-        # ----------------------------------------------------
 
         threading.Thread(
             target=self._load_model_worker,
@@ -119,13 +98,13 @@ class UIOperationsMixin:
             daemon=True,
         ).start()
 
-
     def _load_model_worker(
         self,
         model_name,
         engine_class,
     ):
         engine = None
+        pipeline = None
 
         try:
             self.logger.info(
@@ -152,12 +131,16 @@ class UIOperationsMixin:
                     "engine.name in config.yaml."
                 )
 
-            model_path = (
-                PROJECT_ROOT
-                / config
+            model_path_value = (
+                config
                 .get("model", {})
                 .get("path", "")
             )
+
+            model_path = Path(model_path_value)
+
+            if not model_path.is_absolute():
+                model_path = PROJECT_ROOT / model_path
 
             self.logger.info(
                 "MODEL | model directory: %s",
@@ -168,6 +151,10 @@ class UIOperationsMixin:
                 raise FileNotFoundError(
                     f"Model directory not found: {model_path}"
                 )
+
+            # ------------------------------------------------
+            # Whisper engine
+            # ------------------------------------------------
 
             self.logger.info(
                 "MODEL | initializing engine: %s",
@@ -184,7 +171,7 @@ class UIOperationsMixin:
 
             engine.load()
 
-            elapsed = (
+            engine_elapsed = (
                 time.perf_counter()
                 - started
             )
@@ -192,24 +179,56 @@ class UIOperationsMixin:
             self.logger.info(
                 "MODEL | engine.load() completed | "
                 "elapsed=%.3f sec",
-                elapsed,
+                engine_elapsed,
             )
 
-            self.engine = engine
+            # ------------------------------------------------
+            # Meeting Pipeline
+            # ------------------------------------------------
 
             self.logger.info(
-                "MODEL | initializing AudioChunker"
+                "MEETING | initializing MeetingPipeline"
             )
 
-            self.chunker = AudioChunker(config)
+            pipeline = MeetingPipeline(
+                config,
+                engine,
+            )
+
+            self.logger.info(
+                "MEETING | calling MeetingPipeline.load()"
+            )
+
+            pipeline_started = time.perf_counter()
+
+            pipeline.load()
+
+            pipeline_elapsed = (
+                time.perf_counter()
+                - pipeline_started
+            )
+
+            self.logger.info(
+                "MEETING | MeetingPipeline.load() completed | "
+                "elapsed=%.3f sec",
+                pipeline_elapsed,
+            )
+
+            # ------------------------------------------------
+            # Store loaded objects
+            # ------------------------------------------------
+
+            self.engine = engine
+            self.pipeline = pipeline
 
             self.model_loaded = True
 
             self.logger.info(
                 "MODEL | loading completed successfully | "
-                "model=%s | elapsed=%.3f sec",
+                "model=%s | engine=%.3fs | pipeline=%.3fs",
                 model_name,
-                elapsed,
+                engine_elapsed,
+                pipeline_elapsed,
             )
 
             self.ui_call(
@@ -217,103 +236,32 @@ class UIOperationsMixin:
             )
 
         except Exception:
-            if engine is not None:
-                try:
-                    engine.unload()
-                except Exception:
-                    pass
-
             self.logger.exception(
                 "MODEL | loading failed | model=%s",
                 model_name,
             )
 
-            self.ui_call(
-                self._model_load_failed_ui
-            )
+            if pipeline is not None:
+                try:
+                    pipeline.unload()
+                except Exception:
+                    self.logger.exception(
+                        "MEETING | failed to unload pipeline "
+                        "after loading error"
+                    )
 
-
-
-
-
-
-    
-
-    def _load_model_worker(
-        self,
-        model_name,
-        engine_class,
-    ):
-        engine = None
-
-        try:
-            config = self.load_config()
-
-            configured = (
-                config
-                .get("engine", {})
-                .get("name")
-            )
-
-            if configured and configured != model_name:
-                raise ValueError(
-                    "Selected model does not match "
-                    "engine.name in config.yaml."
-                )
-
-            model_path = (
-                PROJECT_ROOT
-                / config
-                .get("model", {})
-                .get("path", "")
-            )
-
-            self.logger.info(
-                "Model directory: %s",
-                model_path,
-            )
-
-            if not model_path.exists():
-                raise FileNotFoundError(
-                    f"Model directory not found: {model_path}"
-                )
-
-            started = time.perf_counter()
-
-            engine = engine_class(config)
-
-            self.logger.info("Loading engine...")
-
-            engine.load()
-
-            elapsed = (
-                time.perf_counter()
-                - started
-            )
-
-            self.engine = engine
-
-            self.chunker = AudioChunker(config)
-
-            self.model_loaded = True
-
-            self.logger.info(
-                "Engine loaded successfully in %.3f sec.",
-                elapsed,
-            )
-
-            self.ui_call(self._model_loaded_ui)
-
-        except Exception:
             if engine is not None:
                 try:
                     engine.unload()
                 except Exception:
-                    pass
+                    self.logger.exception(
+                        "MODEL | failed to unload engine "
+                        "after loading error"
+                    )
 
-            self.logger.exception(
-                "Model loading failed."
-            )
+            self.pipeline = None
+            self.engine = None
+            self.model_loaded = False
 
             self.ui_call(
                 self._model_load_failed_ui
@@ -324,20 +272,29 @@ class UIOperationsMixin:
         self.processing = False
         self.operation = None
 
-        # توقف Spinner مدل
-        self.main_page.set_model_loading(False)
+        try:
+            self.main_page.set_model_loading(False)
+        except Exception:
+            pass
 
-        # توقف قطعی Progress Animation
-        self.main_page.set_processing_success(
-            "مدل با موفقیت بارگذاری شد."
-        )
+        try:
+            self.main_page.set_processing_success(
+                "مدل و موتور پردازش جلسه با موفقیت بارگذاری شدند."
+            )
+        except Exception:
+            self.set_status("loaded")
+            self.set_progress(0, "")
 
         self.refresh_controls()
 
         self.logger.info(
-            "MODEL | UI updated | model_loaded=%s | current_audio=%s",
+            "MODEL | UI updated | "
+            "model_loaded=%s | current_audio=%s | "
+            "engine=%s | pipeline=%s",
             self.model_loaded,
             self.current_audio,
+            self.engine is not None,
+            self.pipeline is not None,
         )
 
     def _model_load_failed_ui(self):
@@ -345,13 +302,19 @@ class UIOperationsMixin:
         self.operation = None
         self.model_loaded = False
         self.engine = None
-        self.chunker = None
+        self.pipeline = None
 
-        self.main_page.set_model_loading(False)
+        try:
+            self.main_page.set_model_loading(False)
+        except Exception:
+            pass
 
-        self.main_page.set_processing_error(
-            "خطا در بارگذاری مدل."
-        )
+        try:
+            self.main_page.set_processing_error(
+                "خطا در بارگذاری مدل و Pipeline."
+            )
+        except Exception:
+            self.set_status("error")
 
         self.refresh_controls()
 
@@ -381,7 +344,7 @@ class UIOperationsMixin:
         self.refresh_controls()
 
         self.logger.info(
-            "Unloading engine..."
+            "MODEL | unloading started"
         )
 
         threading.Thread(
@@ -391,15 +354,33 @@ class UIOperationsMixin:
 
     def _unload_model_worker(self):
         try:
-            if self.engine:
-                self.engine.unload()
+            # Pipeline must be unloaded before ASR engine.
+            if self.pipeline is not None:
+                self.logger.info(
+                    "MEETING | unloading MeetingPipeline"
+                )
 
-            self.engine = None
-            self.chunker = None
+                try:
+                    self.pipeline.unload()
+                except Exception:
+                    self.logger.exception(
+                        "MEETING | MeetingPipeline unload failed"
+                    )
+
+                self.pipeline = None
+
+            if self.engine is not None:
+                self.logger.info(
+                    "MODEL | unloading Whisper engine"
+                )
+
+                self.engine.unload()
+                self.engine = None
+
             self.model_loaded = False
 
             self.logger.info(
-                "Engine unloaded."
+                "MODEL | unload completed"
             )
 
             self.ui_call(
@@ -408,7 +389,7 @@ class UIOperationsMixin:
 
         except Exception:
             self.logger.exception(
-                "Engine unload failed."
+                "MODEL | unload failed"
             )
 
             self.ui_call(
@@ -418,6 +399,9 @@ class UIOperationsMixin:
     def _model_unloaded_ui(self):
         self.processing = False
         self.operation = None
+        self.model_loaded = False
+        self.pipeline = None
+        self.engine = None
 
         self.set_status("unloaded")
         self.refresh_controls()
@@ -478,16 +462,15 @@ class UIOperationsMixin:
             )
             return
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        # current_audio belongs to the application state.
-        # The actual text widget belongs to MainPage.
-        # ----------------------------------------------------
-
         self.current_audio = selected_path
         self.audio_var = str(selected_path)
-
         self.current_result = None
+
+        if hasattr(self, "current_output_txt"):
+            self.current_output_txt = None
+
+        if hasattr(self, "current_output_json"):
+            self.current_output_json = None
 
         self.main_page.transcription_text.set_text(
             text["no_transcription"],
@@ -578,11 +561,14 @@ class UIOperationsMixin:
 
             self.current_audio = Path(output_path)
             self.audio_var = str(self.current_audio)
-
             self.current_result = None
 
-            # IMPORTANT:
-            # transcription_text belongs to MainPage.
+            if hasattr(self, "current_output_txt"):
+                self.current_output_txt = None
+
+            if hasattr(self, "current_output_json"):
+                self.current_output_json = None
+
             self.main_page.transcription_text.set_text(
                 self.TEXT["no_transcription"],
                 self.language == "fa",
@@ -621,17 +607,22 @@ class UIOperationsMixin:
                 )
 
     # ========================================================
-    # Transcription
+    # Meeting transcription
     # ========================================================
 
     def transcribe(self):
         if self.processing or self.recording:
             return
 
+        # ----------------------------------------------------
+        # IMPORTANT:
+        # The UI now requires MeetingPipeline, not AudioChunker.
+        # ----------------------------------------------------
+
         if (
             not self.model_loaded
-            or not self.engine
-            or not self.chunker
+            or self.engine is None
+            or self.pipeline is None
         ):
             return QMessageBox.warning(
                 self,
@@ -666,12 +657,17 @@ class UIOperationsMixin:
             self.refresh_controls()
             return
 
-        engine = self.engine
-        chunker = self.chunker
+        pipeline = self.pipeline
 
         self.processing = True
         self.operation = "processing"
         self.current_result = None
+
+        if hasattr(self, "current_output_txt"):
+            self.current_output_txt = None
+
+        if hasattr(self, "current_output_json"):
+            self.current_output_json = None
 
         self.set_progress(0, "")
 
@@ -684,375 +680,175 @@ class UIOperationsMixin:
         self.refresh_controls()
 
         self.logger.info(
-            "Starting transcription: %s",
+            "============================================================"
+        )
+
+        self.logger.info(
+            "MEETING | transcription started"
+        )
+
+        self.logger.info(
+            "MEETING | audio=%s",
             audio_path,
+        )
+
+        self.logger.info(
+            "MEETING | pipeline=%s",
+            type(pipeline).__name__,
         )
 
         threading.Thread(
             target=self._transcription_worker,
             args=(
                 audio_path,
-                engine,
-                chunker,
+                pipeline,
             ),
             daemon=True,
         ).start()
 
     def _transcription_worker(
         self,
-        audio_path,
-        engine,
-        chunker,
+        audio_path: Path,
+        pipeline: MeetingPipeline,
     ):
         started = time.perf_counter()
 
         try:
-            self.logger.info(
-                "Analyzing audio and creating chunks..."
-            )
-
-            chunks = chunker.chunk_file(audio_path)
-
-            if not chunks:
-                raise RuntimeError(
-                    "No audio chunks were created."
-                )
-
-            total = len(chunks)
+            # ------------------------------------------------
+            # Configuration
+            # ------------------------------------------------
 
             self.logger.info(
-                "Created %d chunk(s) from %s",
-                total,
-                audio_path.name,
+                "MEETING | loading configuration"
             )
 
-            for chunk in chunks:
-                self.logger.info(
-                    "Chunk %03d | %s -> %s | %.2f sec",
-                    chunk.index,
-                    format_seconds(chunk.start),
-                    format_seconds(chunk.end),
-                    chunk.duration,
-                )
+            config = self.load_config()
 
-            self.ui_call(
-                lambda: self._prepare_progress_ui(total)
+            # ------------------------------------------------
+            # Output directory
+            # ------------------------------------------------
+
+            output_dir = self.get_output_dir(config)
+
+            file_output_dir = (
+                output_dir / audio_path.stem
             )
 
-            chunk_results = []
-            texts = []
+            file_output_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
-            total_audio = 0.0
-            total_inference = 0.0
+            self.logger.info(
+                "MEETING | output directory=%s",
+                file_output_dir,
+            )
 
-            for position, chunk in enumerate(
-                chunks,
-                1,
-            ):
-                elapsed = (
-                    time.perf_counter()
-                    - started
-                )
+            # ------------------------------------------------
+            # Main backend pipeline
+            # ------------------------------------------------
 
-                operation_text = (
-                    TEXTS[self.language]["processing_chunk"]
-                    + f" {position} / {total}"
-                )
+            self.logger.info(
+                "MEETING | calling MeetingPipeline.process()"
+            )
 
-                self.ui_call(
-                    lambda
-                    operation_text=operation_text,
-                    index=position,
-                    elapsed=elapsed:
-                    self._update_processing_ui(
-                        operation_text,
-                        index,
-                        total,
-                        elapsed,
-                    )
-                )
+            self.logger.info(
+                "MEETING | this may take some time during "
+                "diarization / speaker isolation / ASR"
+            )
 
-                self.logger.info(
-                    "[%d/%d] Transcribing chunk %03d...",
-                    position,
-                    total,
-                    chunk.index,
-                )
-
-                inference_started = (
-                    time.perf_counter()
-                )
-
-                raw = engine.transcribe(
-                    chunk.audio,
-                    sample_rate=chunker.sample_rate,
-                )
-
-                inference_time = (
-                    time.perf_counter()
-                    - inference_started
-                )
-
-                if isinstance(raw, dict):
-                    text = str(
-                        raw.get("text", "")
-                    ).strip()
-                else:
-                    text = str(
-                        raw or ""
-                    ).strip()
-
-                duration = float(chunk.duration)
-
-                total_audio += duration
-                total_inference += inference_time
-
-                if text:
-                    texts.append(text)
-
-                rtf = (
-                    inference_time / duration
-                    if duration > 0
-                    else None
-                )
-
-                realtime_factor = (
-                    duration / inference_time
-                    if inference_time > 0
-                    else None
-                )
-
-                chunk_results.append(
-                    {
-                        "index": int(chunk.index),
-                        "start": round(
-                            float(chunk.start),
-                            3,
-                        ),
-                        "end": round(
-                            float(chunk.end),
-                            3,
-                        ),
-                        "duration": round(
-                            duration,
-                            3,
-                        ),
-                        "inference_time": round(
-                            inference_time,
-                            3,
-                        ),
-                        "rtf": (
-                            round(rtf, 6)
-                            if rtf is not None
-                            else None
-                        ),
-                        "realtime_factor": (
-                            round(
-                                realtime_factor,
-                                3,
-                            )
-                            if realtime_factor is not None
-                            else None
-                        ),
-                        "text": text,
-                    }
-                )
-
-                self.logger.info(
-                    "Chunk %03d completed | "
-                    "audio=%.2fs | "
-                    "inference=%.2fs | "
-                    "RTF=%.3f",
-                    chunk.index,
-                    duration,
-                    inference_time,
-                    rtf or 0.0,
-                )
-
-                self.logger.info(
-                    "Text: %s",
-                    text or "[empty]",
-                )
-
-            final_text = " ".join(
-                item.strip()
-                for item in texts
-                if item and item.strip()
-            ).strip()
+            result = pipeline.process(
+                audio_path,
+                file_output_dir,
+            )
 
             elapsed = (
                 time.perf_counter()
                 - started
             )
 
-            overall_rtf = (
-                total_inference / total_audio
-                if total_audio > 0
-                else None
+            self.logger.info(
+                "MEETING | MeetingPipeline.process() returned"
             )
-
-            overall_realtime = (
-                total_audio / total_inference
-                if total_inference > 0
-                else None
-            )
-
-            config = self.load_config()
-
-            output_dir = self.get_output_dir(config)
-
-            txt_path = (
-                output_dir
-                / f"{audio_path.stem}.txt"
-            )
-
-            json_path = (
-                output_dir
-                / f"{audio_path.stem}.json"
-            )
-
-            output_config = config.get(
-                "output",
-                {},
-            )
-
-            save_txt = output_config.get(
-                "save_txt",
-                True,
-            )
-
-            save_json = output_config.get(
-                "save_json",
-                True,
-            )
-
-            if save_txt:
-                txt_path.write_text(
-                    final_text + "\n",
-                    encoding="utf-8",
-                )
-
-                self.logger.info(
-                    "TXT saved: %s",
-                    txt_path,
-                )
-
-            result = {
-                "file": {
-                    "name": audio_path.name,
-                    "path": str(audio_path),
-                    "extension": audio_path.suffix.lower(),
-                },
-                "engine": {
-                    "name": (
-                        config
-                        .get("engine", {})
-                        .get("name")
-                    ),
-                    "model_path": str(
-                        PROJECT_ROOT
-                        / config
-                        .get("model", {})
-                        .get("path", "")
-                    ),
-                },
-                "audio": {
-                    "sample_rate": chunker.sample_rate,
-                    "language": (
-                        config
-                        .get("audio", {})
-                        .get("language", "fa")
-                    ),
-                    "task": (
-                        config
-                        .get("audio", {})
-                        .get("task", "transcribe")
-                    ),
-                    "duration": round(
-                        total_audio,
-                        3,
-                    ),
-                },
-                "processing": {
-                    "chunks": len(chunks),
-                    "inference_time": round(
-                        total_inference,
-                        3,
-                    ),
-                    "total_processing_time": round(
-                        elapsed,
-                        3,
-                    ),
-                    "rtf": (
-                        round(
-                            overall_rtf,
-                            6,
-                        )
-                        if overall_rtf is not None
-                        else None
-                    ),
-                    "realtime_factor": (
-                        round(
-                            overall_realtime,
-                            3,
-                        )
-                        if overall_realtime is not None
-                        else None
-                    ),
-                },
-                "transcription": {
-                    "text": final_text,
-                },
-                "chunks": chunk_results,
-            }
-
-            if save_json:
-                json_path.write_text(
-                    json.dumps(
-                        result,
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-
-                self.logger.info(
-                    "JSON saved: %s",
-                    json_path,
-                )
-
-            self.current_result = result
 
             self.logger.info(
-                "FILE COMPLETED | "
-                "File: %s | "
-                "Audio: %.2f sec | "
-                "Chunks: %d | "
-                "Inference: %.2f sec | "
-                "Total: %.2f sec",
-                audio_path.name,
-                total_audio,
-                len(chunks),
-                total_inference,
+                "MEETING | processing elapsed=%.3f sec",
                 elapsed,
             )
 
+            # ------------------------------------------------
+            # Expected backend outputs
+            # ------------------------------------------------
+
+            txt_path = (
+                file_output_dir
+                / f"{audio_path.stem}_meeting.txt"
+            )
+
+            json_path = (
+                file_output_dir
+                / f"{audio_path.stem}_meeting.json"
+            )
+
+            self.logger.info(
+                "MEETING | checking TXT=%s",
+                txt_path,
+            )
+
+            if not txt_path.exists():
+                raise FileNotFoundError(
+                    "MeetingPipeline completed but expected "
+                    f"TXT file was not created: {txt_path}"
+                )
+
+            meeting_text = txt_path.read_text(
+                encoding="utf-8"
+            )
+
+            self.logger.info(
+                "MEETING | TXT loaded successfully"
+            )
+
+            self.logger.info(
+                "MEETING | transcript characters=%d",
+                len(meeting_text),
+            )
+
+            if json_path.exists():
+                self.logger.info(
+                    "MEETING | JSON output=%s",
+                    json_path,
+                )
+            else:
+                self.logger.warning(
+                    "MEETING | JSON output not found: %s",
+                    json_path,
+                )
+
+            # ------------------------------------------------
+            # Send result to UI
+            # ------------------------------------------------
+
             self.ui_call(
-                lambda: self._transcription_completed_ui(
-                    final_text,
-                    result,
-                    elapsed,
+                lambda:
+                self._transcription_completed_ui(
+                    result=result,
+                    meeting_text=meeting_text,
+                    txt_path=txt_path,
+                    json_path=json_path,
+                    elapsed=elapsed,
                 )
             )
 
-        except Exception:
+        except Exception as exc:
             self.logger.exception(
-                "Failed processing file: %s",
+                "MEETING | processing failed | file=%s",
                 audio_path.name,
             )
 
             self.ui_call(
-                self._transcription_failed_ui
+                lambda error=exc:
+                self._transcription_failed_ui(error)
             )
 
     # ========================================================
@@ -1063,21 +859,29 @@ class UIOperationsMixin:
         """
         Prepare progress controls.
 
-        These widgets belong to MainPage.
+        MeetingPipeline currently owns the actual backend
+        stages, so the UI uses an indeterminate progress
+        indicator rather than pretending chunk progress.
         """
 
-        self.main_page.progress.setRange(
-            0,
-            max(total, 1),
-        )
+        try:
+            self.main_page.progress.setRange(
+                0,
+                0,
+            )
+        except Exception:
+            pass
 
-        self.main_page.operation_label.setText(
-            ""
-        )
+        try:
+            self.main_page.operation_label.setText(
+                "در حال پردازش جلسه..."
+            )
+        except Exception:
+            pass
 
         self.set_progress(
             0,
-            f"0 / {total}",
+            "در حال پردازش...",
         )
 
     def _update_processing_ui(
@@ -1087,60 +891,91 @@ class UIOperationsMixin:
         total,
         elapsed,
     ):
-        """
-        Update processing progress.
+        try:
+            self.main_page.operation_label.setText(
+                operation
+            )
+        except Exception:
+            pass
 
-        This method is called on the Qt UI thread.
-        """
-
-        self.main_page.operation_label.setText(
-            operation
-        )
-
-        self.main_page.progress.setRange(
-            0,
-            max(total, 1),
-        )
+        try:
+            self.main_page.progress.setRange(
+                0,
+                0,
+            )
+        except Exception:
+            pass
 
         self.set_progress(
-            index,
+            0,
             (
-                f"{index} / {total}"
-                f"  •  "
-                f"{TEXTS[self.language]['elapsed']}: "
-                f"{elapsed:.1f}s"
+                f"{operation}  •  "
+                f"elapsed: {elapsed:.1f}s"
             ),
         )
 
     def _transcription_completed_ui(
         self,
-        text,
         result,
+        meeting_text,
+        txt_path,
+        json_path,
         elapsed,
     ):
         self.processing = False
         self.operation = None
 
-        total = result["processing"]["chunks"]
+        # Store the actual backend result.
+        self.current_result = result
 
-        self.main_page.progress.setRange(
-            0,
-            max(total, 1),
+        # Store actual generated files.
+        self.current_output_txt = Path(txt_path)
+
+        self.current_output_json = (
+            Path(json_path)
+            if json_path.exists()
+            else None
         )
 
-        self.set_progress(
-            total,
-            f"{total} / {total}",
-        )
+        # ----------------------------------------------------
+        # Progress
+        # ----------------------------------------------------
+
+        try:
+            self.main_page.progress.setRange(
+                0,
+                1,
+            )
+
+            self.set_progress(
+                1,
+                "1 / 1",
+            )
+        except Exception:
+            pass
+
+        # ----------------------------------------------------
+        # Display actual MeetingPipeline transcript.
+        #
+        # Example:
+        #
+        # [0.115 -> 1.027] SPEAKER_01: سلام به همه
+        # [1.094 -> 5.144] SPEAKER_01: ...
+        # ----------------------------------------------------
 
         self.main_page.transcription_text.set_text(
-            text or self.TEXT["no_transcription"],
+            meeting_text.strip()
+            if meeting_text.strip()
+            else self.TEXT["no_transcription"],
             self.language == "fa",
         )
 
-        self.main_page.operation_label.setText(
-            ""
-        )
+        try:
+            self.main_page.operation_label.setText(
+                ""
+            )
+        except Exception:
+            pass
 
         self.set_status(
             "completed",
@@ -1148,6 +983,27 @@ class UIOperationsMixin:
                 f"{self.TEXT['elapsed']}: "
                 f"{elapsed:.2f}s"
             ),
+        )
+
+        self.logger.info(
+            "MEETING | UI updated successfully"
+        )
+
+        self.logger.info(
+            "MEETING | TXT=%s",
+            txt_path,
+        )
+
+        if json_path.exists():
+            self.logger.info(
+                "MEETING | JSON=%s",
+                json_path,
+            )
+
+        self.logger.info(
+            "MEETING | transcription completed | "
+            "elapsed=%.3f sec",
+            elapsed,
         )
 
         self.refresh_controls()
@@ -1159,19 +1015,32 @@ class UIOperationsMixin:
                 "Failed to refresh files page after transcription."
             )
 
-    def _transcription_failed_ui(self):
+    def _transcription_failed_ui(self, error):
         self.processing = False
         self.operation = None
 
-        self.main_page.operation_label.setText("")
+        try:
+            self.main_page.operation_label.setText(
+                ""
+            )
+        except Exception:
+            pass
 
         self.set_status("error")
         self.refresh_controls()
 
+        self.logger.error(
+            "MEETING | UI processing failure: %s",
+            error,
+        )
+
         QMessageBox.critical(
             self,
             self.TEXT["error"],
-            self.TEXT["transcription_failed"],
+            (
+                f"{self.TEXT['transcription_failed']}\n\n"
+                f"{error}"
+            ),
         )
 
     # ========================================================
@@ -1179,72 +1048,131 @@ class UIOperationsMixin:
     # ========================================================
 
     def export_txt(self):
-        if not self.current_result:
-            return
-
-        text = (
-            self.current_result
-            .get("transcription", {})
-            .get("text", "")
-        )
-
-        filename = (
-            Path(
-                self.current_result
-                .get("file", {})
-                .get("name", "transcription")
-            ).stem
-            + ".txt"
-        )
-
-        path, _ = QFileDialog.getSaveFileName(
+        # Prefer the actual MeetingPipeline TXT.
+        source_text = getattr(
             self,
-            self.TEXT["export_txt"],
-            str(
-                DEFAULT_OUTPUT_DIR
-                / filename
-            ),
-            "TXT (*.txt)",
+            "current_output_txt",
+            None,
         )
 
-        if path:
-            Path(path).write_text(
-                text,
-                encoding="utf-8",
-            )
+        if source_text is not None:
+            source_text = Path(source_text)
 
-            self.logger.info(
-                "TXT exported: %s",
-                path,
-            )
+            if source_text.exists():
+                default_name = (
+                    source_text.stem
+                    + ".txt"
+                )
 
-            QMessageBox.information(
-                self,
-                self.TEXT["success"],
-                (
-                    f"{self.TEXT['saved_txt']}\n"
-                    f"{path}"
-                ),
-            )
+                path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    self.TEXT["export_txt"],
+                    str(
+                        DEFAULT_OUTPUT_DIR
+                        / default_name
+                    ),
+                    "TXT (*.txt)",
+                )
 
-            self.files_page.reload()
+                if path:
+                    Path(path).write_text(
+                        source_text.read_text(
+                            encoding="utf-8"
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    self.logger.info(
+                        "TXT exported: %s",
+                        path,
+                    )
+
+                    QMessageBox.information(
+                        self,
+                        self.TEXT["success"],
+                        (
+                            f"{self.TEXT['saved_txt']}\n"
+                            f"{path}"
+                        ),
+                    )
+
+                    self.files_page.reload()
+
+                return
+
+        QMessageBox.warning(
+            self,
+            self.TEXT["warning"],
+            "ابتدا یک جلسه را پردازش کنید.",
+        )
 
     # ========================================================
     # Export JSON
     # ========================================================
 
     def export_json(self):
-        if not self.current_result:
+        source_json = getattr(
+            self,
+            "current_output_json",
+            None,
+        )
+
+        if source_json is not None:
+            source_json = Path(source_json)
+
+            if source_json.exists():
+                default_name = (
+                    source_json.stem
+                    + ".json"
+                )
+
+                path, _ = QFileDialog.getSaveFileName(
+                    self,
+                    self.TEXT["export_json"],
+                    str(
+                        DEFAULT_OUTPUT_DIR
+                        / default_name
+                    ),
+                    "JSON (*.json)",
+                )
+
+                if path:
+                    Path(path).write_text(
+                        source_json.read_text(
+                            encoding="utf-8"
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    self.logger.info(
+                        "JSON exported: %s",
+                        path,
+                    )
+
+                    QMessageBox.information(
+                        self,
+                        self.TEXT["success"],
+                        (
+                            f"{self.TEXT['saved_json']}\n"
+                            f"{path}"
+                        ),
+                    )
+
+                    self.files_page.reload()
+
+                return
+
+        # Fallback: export in-memory result if backend JSON
+        # was not produced.
+        if self.current_result is None:
+            QMessageBox.warning(
+                self,
+                self.TEXT["warning"],
+                "ابتدا یک جلسه را پردازش کنید.",
+            )
             return
 
-        filename = (
-            Path(
-                self.current_result
-                .get("file", {})
-                .get("name", "transcription")
-            ).stem
-            + ".json"
-        )
+        filename = "meeting_result.json"
 
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1372,7 +1300,9 @@ class UIOperationsMixin:
             .replace("\r", "\n")
         )
 
-        QGuiApplication.clipboard().setText(text)
+        QGuiApplication.clipboard().setText(
+            text
+        )
 
         self.logger.info(
             "Transcription copied to clipboard."
@@ -1422,12 +1352,28 @@ class UIOperationsMixin:
             if self.recording and self.recorder:
                 self.recorder.cancel()
 
-            if self.engine:
+            # Pipeline first, then Whisper.
+            if getattr(self, "pipeline", None):
                 self.logger.info(
-                    "Unloading engine before exit..."
+                    "MEETING | unloading pipeline before exit..."
+                )
+
+                try:
+                    self.pipeline.unload()
+                except Exception:
+                    self.logger.exception(
+                        "MEETING | error while unloading pipeline"
+                    )
+
+                self.pipeline = None
+
+            if getattr(self, "engine", None):
+                self.logger.info(
+                    "MODEL | unloading engine before exit..."
                 )
 
                 self.engine.unload()
+                self.engine = None
 
         except Exception:
             self.logger.exception(
@@ -1441,4 +1387,3 @@ class UIOperationsMixin:
         )
 
         self.close()
-

@@ -486,12 +486,11 @@ class UIAppearanceMixin:
         # ----------------------------------------------------
 
         can_transcribe = (
-            not processing
-            and not recording
-            and bool(loaded)
-            and bool(audio)
+            self.model_loaded
             and self.engine is not None
-            and self.chunker is not None
+            and self.pipeline is not None
+            and self.current_audio is not None
+            and not self.processing
         )
 
         page.transcribe_button.setEnabled(
