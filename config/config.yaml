@@ -1,7 +1,15 @@
+# ============================================================
+# PROJECT
+# ============================================================
+
 project:
   name: persian_asr
   mode: offline
 
+
+# ============================================================
+# ASR ENGINE
+# ============================================================
 
 engine:
   name: whisper_persian_v4
@@ -11,12 +19,20 @@ model:
   path: models/whisper_persian_v4
 
 
+# ============================================================
+# DIARIZATION
+# ============================================================
+
 diarization:
+
   enabled: true
+
   engine: pyannote
+
   model_path: models/diarization/speaker-diarization-community-1
 
   sample_rate: 16000
+
   device: cuda
 
   min_speakers: 3
@@ -29,7 +45,12 @@ diarization:
   use_exclusive: true
 
 
+# ============================================================
+# AUDIO
+# ============================================================
+
 audio:
+
   input_dir: input
   output_dir: output
 
@@ -47,7 +68,12 @@ audio:
     - .ogg
 
 
+# ============================================================
+# PREPROCESSING
+# ============================================================
+
 preprocessing:
+
   enabled: true
 
   resample:
@@ -58,14 +84,22 @@ preprocessing:
     enabled: true
 
   enhancement:
+
     enabled: false
+
     engine: null
+
     denoise: false
     dereverb: false
     normalization: false
 
 
+# ============================================================
+# CHUNKING
+# ============================================================
+
 chunking:
+
   enabled: true
 
   max_chunk_seconds: 30
@@ -91,43 +125,58 @@ debug:
     # Master switch
     enabled: true
 
-    # Relative to project root.
+    # All debug audio is stored relative to project root.
     root_dir: output/debug_audio
 
-    # Speaker clean reference/enrollment audio.
+    # --------------------------------------------------------
+    # Speaker references
+    # --------------------------------------------------------
+
     save_speaker_references: true
 
-    # REAL-T / WeSep local mixture passed to TSE.
+    # --------------------------------------------------------
+    # TSE
+    # --------------------------------------------------------
+
     save_tse_inputs: true
 
-    # REAL-T / WeSep extracted result.
     save_tse_outputs: true
 
-    # Final exact-overlap audio returned by TSE.
     save_tse_overlap: true
 
-    # Audio chunks actually sent to Whisper.
+    # --------------------------------------------------------
+    # Whisper / ASR
+    # --------------------------------------------------------
+
     save_asr_chunks: true
 
-    # Keep internal TSE temporary directory.
+    # --------------------------------------------------------
+    # TSE temporary files
+    # --------------------------------------------------------
     #
-    # If true, temporary files are not deleted.
+    # true:
+    #   keep mixture.wav and other files created for TSE.
+    #
+    # false:
+    #   normal TemporaryDirectory cleanup is used.
+    #
     keep_tse_temp: true
 
 
 # ============================================================
-# REAL-T / WeSep overlap separation
+# REAL-T / WeSep TARGET SPEAKER EXTRACTION
 # ============================================================
 
 overlap_separation:
 
-  enabled: true
+  enabled: false
 
   engine: real_t
 
   model_path: models/REAL-T/spk_emb_100
 
   wesep_path: models/WeSep
+
   wespeaker_path: models/WeSpeaker
 
   sample_rate: 16000
@@ -143,46 +192,55 @@ overlap_separation:
 
   max_region_seconds: 8.0
 
-  # Legacy option.
+  # Legacy compatibility.
   merge_gap_seconds: 0.10
 
-  # Used only when debug.audio is disabled.
+  # Used for persistent TSE temporary files.
   temp_dir: output/.tse_tmp
 
-  # Can independently keep the TSE temporary files.
+  # Legacy compatibility.
+  #
+  # debug.audio.keep_tse_temp has priority conceptually,
+  # but true here also forces persistence.
   keep_temp_files: false
+
+  output_norm: true
 
 
 # ============================================================
-# Speaker isolation
+# SPEAKER ISOLATION
 # ============================================================
 
 speaker_isolation:
 
-  enabled: true
+  # Must be enabled if we want:
+  #   - speaker timelines
+  #   - automatic references
+  #   - REAL-T overlap extraction
+  enabled: false
 
+  # Keep every isolated speaker on the original timeline.
   preserve_timeline: true
 
-  # Existing manually prepared references can still be used.
+  # Directory used by REAL-T as enrollment/reference source.
   references_dir: output/references
 
-  # Automatically create a reference from clean speech.
+  # Automatically build a reference from clean speech.
   auto_create_references: true
 
-  # Rebuild the reference every run.
-  #
-  # Set false if you want manually prepared references
-  # to remain untouched.
+  # Rebuild reference every run.
   overwrite_references: true
 
-  # Maximum duration of each speaker reference.
+  # Maximum reference duration per speaker.
   reference_max_seconds: 8.0
 
-  # Minimum clean speech required to create a reference.
+  # Minimum clean speech needed for reference creation.
   reference_min_seconds: 1.0
 
+  # Keep speaker timeline metadata.
   save_timeline: true
 
+  # Isolated speaker WAV files.
   output_dir: speakers
 
 
@@ -192,37 +250,163 @@ speaker_isolation:
 
 asr:
 
+  # Ignore diarization fragments shorter than this
+  # when creating useful ASR groups.
   min_turn_seconds: 0.20
 
+  # Legacy upper limit.
   max_turn_seconds: 30.0
 
   trim_silence: false
 
+
   # ----------------------------------------------------------
-  # Group short/consecutive turns before Whisper.
+  # ASR GROUPING
   # ----------------------------------------------------------
+  #
+  # Example:
+  #
+  #   SPEAKER_00  19.99 -> 20.65
+  #   SPEAKER_00  20.94 -> 21.49
+  #   SPEAKER_00  24.28 -> 25.02
+  #
+  # If the gaps are <= max_gap_seconds and the complete
+  # timeline chunk stays <= max_chunk_seconds, Whisper receives
+  # one larger audio chunk.
+  #
+  # The isolated speaker timeline preserves the original
+  # timing, so the gaps remain silent.
 
   grouping:
 
     enabled: true
 
-    # Same speaker turns separated by <= this amount
-    # are considered consecutive.
+    # ========================================================
+    # NORMAL GROUPING
+    # ========================================================
+
+    # Maximum silence between two same-speaker turns.
     max_gap_seconds: 1.50
 
-    # Maximum timeline duration of one Whisper request.
+    # Maximum total timeline duration of an ASR group.
     max_chunk_seconds: 30.0
 
-    # Do not create groups shorter than this value
-    # unless they are the only available turn.
-    min_group_seconds: 0.20
+    # Minimum valid timeline duration.
+    min_group_seconds: 0.50
 
-    # Keep original silent gaps between grouped turns.
-    #
-    # Because speaker timelines are timeline-preserving,
-    # speech from other speakers is already zeroed.
+    # Preserve original timeline gaps inside the WAV.
     preserve_gaps: true
 
+
+    # ========================================================
+    # SHORT TURN FILTER
+    # ========================================================
+
+    short_turn_filter:
+
+      enabled: true
+
+      # Any diarization turn below this duration is ignored.
+      #
+      # Example:
+      #
+      # SPEAKER_01  10.0 -> 15.0
+      # SPEAKER_02  15.0 -> 15.4
+      # SPEAKER_01  15.5 -> 20.0
+      #
+      # SPEAKER_02 is ignored.
+      ignore_below_seconds: 0.50
+
+      # Allow the original speaker group to continue after
+      # an ignored short turn.
+      bridge_same_speaker: true
+
+      # Maximum gap when an ignored short turn occurred.
+      bridge_max_gap_seconds: 1.50
+
+
+    # ========================================================
+    # SHORT OVERLAP FILTER
+    # ========================================================
+
+    overlap_filter:
+
+      enabled: true
+
+      # Overlaps <= this duration do not break an existing
+      # same-speaker ASR group.
+      ignore_below_seconds: 0.50
+
+      # Do not break a group because of a tiny overlap.
+      do_not_break_group: true
+
+
+    # ========================================================
+    # NOISE / FALSE TURN FILTER
+    # ========================================================
+
+    noise_filter:
+
+      enabled: true
+
+      # Very short diarization fragments are treated as
+      # probable noise / false speaker assignment.
+      max_noise_turn_seconds: 0.50
+
+      # Keep the surrounding same-speaker group continuous.
+      bridge_same_speaker: true
+
+      # Very weak audio protection.
+      min_rms_ratio: 0.08
+
+      min_rms: 0.0005
+
+      # Minimum active audio ratio.
+      min_active_ratio: 0.02
+
+
+    # ========================================================
+    # ACTUAL AUDIO VALIDATION
+    # ========================================================
+
+    audio_validation:
+
+      enabled: true
+
+      # Validate the actual generated numpy audio, not only
+      # start/end timestamps.
+      validate_actual_duration: true
+
+      # Reject actual audio shorter than this.
+      min_audio_seconds: 0.20
+
+      # Reject almost completely inactive groups.
+      min_active_ratio: 0.02
+
+      # Reject zero/silence-only groups.
+      reject_silence_only: true
+
+      # Reject extremely weak/noise-only groups.
+      reject_noise_only: true
+
+
+    # ========================================================
+    # GROUP DEBUG
+    # ========================================================
+
+    debug:
+
+      # Never write invalid groups to debug_audio.
+      save_only_valid_groups: true
+
+      # group_036, group_037, group_038
+      # rather than leaving holes because group_037 was rejected.
+      contiguous_group_numbers: true
+
+
+# ============================================================
+# OUTPUT
+# ============================================================
 
 output:
 
@@ -235,10 +419,453 @@ output:
   save_rttm: true
 
 
+# ============================================================
+# DEVICE
+# ============================================================
+
 device:
+
   type: cuda
   dtype: float16
 
 
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging:
+
   level: INFO
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# OLLAMA
+# ============================================================
+
+ollama:
+
+  # Default local Ollama model.
+  #
+  # This value is kept here for general Ollama usage.
+  # Meeting minutes use meeting_minutes.ollama.model below.
+  #
+  # Change this value if your actual:
+  #
+  #   ollama list
+  #
+  # shows another model tag.
+  model: qwen2.5:14b
+
+
+# ============================================================
+# MEETING MINUTES / LOCAL LLM
+# ============================================================
+
+meeting_minutes:
+
+  enabled: true
+
+
+  # ----------------------------------------------------------
+  # OLLAMA CONNECTION
+  # ----------------------------------------------------------
+
+  ollama:
+
+    # Exact model tag shown by:
+    #
+    #   ollama list
+    #
+    model: qwen2.5:14b
+
+    # Local Ollama API.
+    host: http://127.0.0.1:11434
+
+    # Low temperature is intentional.
+    #
+    # The task is factual summarization of an ASR transcript,
+    # not creative text generation.
+    temperature: 0.1
+
+
+  # ----------------------------------------------------------
+  # PROMPT
+  # ----------------------------------------------------------
+  #
+  # IMPORTANT:
+  #
+  # The transcript is inserted by the test program after this
+  # prompt is loaded from YAML.
+  #
+  # The model must NOT treat the transcript as ground truth.
+  # It is an AI-generated ASR transcript and may contain
+  # hearing/transcription errors.
+  #
+
+  prompt: |
+    نقش شما:
+    شما یک دبیر حرفه‌ای جلسه، ویراستار صورتجلسه و تحلیلگر دقیق
+    متن فارسی هستید.
+
+    وظیفه شما این است که بر اساس متن Transcript که در ادامه
+    دریافت می‌کنید، یک «صورتجلسه کامل، رسمی، دقیق و قابل استفاده»
+    به زبان فارسی تهیه کنید.
+
+
+    ============================================================
+    منبع داده و محدودیت بسیار مهم
+    ============================================================
+
+    متن ورودی توسط سیستم ASR / هوش مصنوعی از روی فایل صوتی جلسه
+    تولید شده است.
+
+    بنابراین Transcript ممکن است دارای خطاهای شنیداری یا
+    تشخیص گفتار باشد، از جمله:
+
+    - اشتباه در تشخیص بعضی کلمات فارسی
+    - اشتباه در نام اشخاص
+    - اشتباه در نام سازمان‌ها، پروژه‌ها یا محصولات
+    - اشتباه در اعداد و ارقام
+    - اشتباه در تاریخ یا ساعت
+    - حذف بخشی از جمله
+    - اضافه شدن کلمات اشتباه
+    - علائم نگارشی نادرست
+    - جمله‌های ناقص
+    - نسبت دادن بخشی از صحبت به Speaker اشتباه
+    - تشخیص اشتباه گوینده
+    - هم‌پوشانی یا تداخل گفتار
+    - تکرار یا قطعه‌قطعه شدن بخشی از گفتار
+
+    بنابراین Transcript را یک منبع خام و دارای خطای احتمالی در نظر
+    بگیر، نه یک متن کاملاً قطعی و ویرایش‌شده.
+
+
+    ============================================================
+    اصل عدم جعل اطلاعات
+    ============================================================
+
+    مهم‌ترین قانون:
+
+    هرگز اطلاعاتی را که در Transcript وجود ندارد از خودت ایجاد نکن.
+
+    به‌خصوص هرگز این موارد را حدس نزن یا جعل نکن:
+
+    - نام افراد
+    - نام سازمان‌ها
+    - تاریخ جلسه
+    - ساعت جلسه
+    - محل جلسه
+    - سمت افراد
+    - شماره‌ها
+    - اعداد مالی
+    - درصدها
+    - مهلت‌ها
+    - مسئول انجام کار
+    - تصمیمات
+    - مصوبات
+    - تعهدات
+    - برنامه‌های آینده
+    - نام پروژه
+    - نام محصول
+    - علت یک تصمیم
+
+
+    ============================================================
+    نحوه برخورد با اطلاعات نامطمئن
+    ============================================================
+
+    اگر بخشی از Transcript از نظر معنایی یا شنیداری نامطمئن است:
+
+    1. آن را با قطعیت بازنویسی نکن.
+    2. چیزی را برای کامل کردن جمله حدس نزن.
+    3. اگر امکان بازسازی مطمئن وجود ندارد، آن را با عباراتی مانند:
+       «نامشخص»
+       «در Transcript به‌صورت نامشخص ثبت شده است»
+       یا
+       «نیازمند بررسی فایل صوتی»
+       مشخص کن.
+    4. موارد مشکوک را در بخش «ابهامات و موارد نیازمند بررسی»
+       ثبت کن.
+
+
+    ============================================================
+    تشخیص افراد و Speakerها
+    ============================================================
+
+    اگر نام واقعی افراد در Transcript وجود دارد، همان نام را
+    استفاده کن.
+
+    اگر نام فرد مشخص نیست ولی Transcript دارای شناسه‌هایی مانند:
+
+    SPEAKER_00
+    SPEAKER_01
+    SPEAKER_02
+
+    است، از همان شناسه استفاده کن.
+
+    هرگز برای Speakerها نام واقعی فرضی ایجاد نکن.
+
+    اگر مشخص نیست کدام شخص یک جمله را گفته است، مسئولیت یا نظر را
+    به شخص خاصی نسبت نده.
+
+
+    ============================================================
+    تصمیمات جلسه
+    ============================================================
+
+    بین این موارد تفاوت بگذار:
+
+    1. تصمیم قطعی
+    2. پیشنهاد
+    3. نظر شخصی
+    4. موضوع مورد بحث
+    5. گزینه پیشنهادی
+    6. موضوع بدون تصمیم نهایی
+
+    فقط مواردی را به عنوان «تصمیم/مصوبه» ثبت کن که Transcript
+    به اندازه کافی نشان دهد واقعاً تصمیم گرفته شده است.
+
+    اگر موضوع فقط مطرح شده یا پیشنهاد شده، آن را به عنوان مصوبه
+    قطعی معرفی نکن.
+
+
+    ============================================================
+    اقدامات و Action Items
+    ============================================================
+
+    فقط اقداماتی را ثبت کن که در Transcript به‌صورت مشخص مطرح شده‌اند.
+
+    برای هر اقدام در صورت وجود اطلاعات، این موارد را استخراج کن:
+
+    - شرح اقدام
+    - مسئول انجام
+    - موعد انجام
+    - وضعیت
+    - توضیحات
+
+    اگر مسئول مشخص نیست:
+
+    «مشخص نشده»
+
+    بنویس.
+
+    اگر deadline مشخص نیست:
+
+    «مشخص نشده»
+
+    بنویس.
+
+    هرگز مسئول یا deadline را حدس نزن.
+
+
+    ============================================================
+    تاریخ، ساعت و محل جلسه
+    ============================================================
+
+    فقط در صورتی که در Transcript بیان شده باشند آنها را استخراج کن.
+
+    اگر وجود ندارند:
+
+    «ذکر نشده»
+
+    بنویس.
+
+    تاریخ یا ساعت را بر اساس حدس، زمان فایل، زمان سیستم یا اطلاعات
+    بیرونی تولید نکن.
+
+
+    ============================================================
+    خلاصه مدیریتی
+    ============================================================
+
+    در ابتدای صورتجلسه یک خلاصه مدیریتی ارائه کن.
+
+    خلاصه باید:
+
+    - کوتاه ولی کامل باشد.
+    - موضوعات اصلی جلسه را پوشش دهد.
+    - تصمیمات مهم را در صورت وجود مشخص کند.
+    - اقدامات مهم را در صورت وجود مشخص کند.
+    - اطلاعات جدیدی خارج از Transcript اضافه نکند.
+
+
+    ============================================================
+    ساختار خروجی
+    ============================================================
+
+    خروجی را دقیقاً به زبان فارسی و با ساختار زیر تولید کن:
+
+    # صورتجلسه جلسه
+
+    ## 1. اطلاعات جلسه
+
+    - عنوان جلسه:
+    - تاریخ:
+    - ساعت:
+    - محل / بستر جلسه:
+    - حاضرین:
+    - غایبین:
+    - منبع:
+
+    در قسمت «منبع» حتماً بنویس:
+
+    «Transcript تولیدشده توسط سیستم ASR/AI؛ ممکن است دارای خطاهای
+    تشخیص گفتار و انتساب گوینده باشد.»
+
+    اگر اطلاعاتی در Transcript وجود ندارد، «ذکر نشده» بنویس.
+
+
+    ## 2. خلاصه مدیریتی
+
+    خلاصه دقیق و غیرتخیلی جلسه.
+
+
+    ## 3. دستور جلسه / موضوعات اصلی
+
+    موضوعات اصلی مطرح‌شده را به شکل فهرست ارائه کن.
+
+
+    ## 4. شرح مذاکرات
+
+    موضوعات جلسه را دسته‌بندی کن.
+
+    برای هر موضوع:
+
+    ### موضوع 1: ...
+
+    - نکات مطرح‌شده
+    - دیدگاه‌های مطرح‌شده
+    - اطلاعات مهم
+    - اختلاف‌نظرها در صورت وجود
+    - نتیجه بحث در صورت وجود
+
+    سپس موضوعات بعدی را نیز به همین شکل بیاور.
+
+
+    ## 5. تصمیمات و مصوبات
+
+    فقط تصمیمات یا مصوبات واقعاً پشتیبانی‌شده توسط Transcript.
+
+    اگر تصمیم قطعی وجود ندارد، صریحاً بنویس:
+
+    «در Transcript تصمیم قطعی و قابل استناد مشخصی ثبت نشده است.»
+
+
+    ## 6. اقدامات و پیگیری‌ها
+
+    این بخش را به شکل جدول ارائه کن:
+
+    | ردیف | اقدام | مسئول | موعد | وضعیت | توضیحات |
+    |---|---|---|---|---|---|
+
+    فقط اقداماتی را وارد کن که در Transcript وجود دارند.
+
+
+    ## 7. مسائل باز
+
+    موضوعاتی که مطرح شده‌اند ولی هنوز نتیجه یا تصمیم نهایی درباره
+    آنها مشخص نیست.
+
+
+    ## 8. ابهامات و موارد نیازمند بررسی
+
+    خطاها یا بخش‌هایی از Transcript که ممکن است به دلیل ASR اشتباه
+    باشند.
+
+    مخصوصاً:
+
+    - نام‌های نامطمئن
+    - اعداد نامطمئن
+    - تاریخ‌های نامطمئن
+    - جملات ناقص
+    - نسبت دادن نامطمئن صحبت به Speaker
+    - بخش‌های دارای معنای مبهم
+
+
+    ## 9. جمع‌بندی نهایی
+
+    یک جمع‌بندی کوتاه و دقیق از وضعیت جلسه ارائه کن.
+
+
+    ============================================================
+    قوانین سبک نگارش
+    ============================================================
+
+    - زبان خروجی: فارسی
+    - لحن: رسمی، حرفه‌ای و اداری
+    - از زیاده‌گویی جلوگیری کن.
+    - متن Transcript را کلمه‌به‌کلمه تکرار نکن.
+    - محتوای آن را خلاصه و سازمان‌دهی کن.
+    - معنی اصلی صحبت‌ها را حفظ کن.
+    - از تغییر معنای صحبت‌ها خودداری کن.
+    - از ادعاهای خارج از Transcript خودداری کن.
+    - هیچ منبع خارجی را وارد تحلیل نکن.
+    - از اطلاعات عمومی برای پر کردن خلأهای Transcript استفاده نکن.
+    - اگر چیزی مشخص نیست، همان نامشخص بودن را حفظ کن.
+    - بین «پیشنهاد» و «تصمیم قطعی» تفاوت بگذار.
+    - بین «صحبت درباره انجام یک کار» و «تعهد قطعی به انجام آن»
+      تفاوت بگذار.
+
+
+    ============================================================
+    کنترل نهایی قبل از پاسخ
+    ============================================================
+
+    قبل از تولید خروجی این موارد را بررسی کن:
+
+    1. آیا اطلاعاتی خارج از Transcript اضافه کرده‌ام؟
+    2. آیا نامی را حدس زده‌ام؟
+    3. آیا تصمیمی را که فقط پیشنهاد بوده به عنوان مصوبه ثبت کرده‌ام؟
+    4. آیا deadline را حدس زده‌ام؟
+    5. آیا مسئول انجام کار را حدس زده‌ام؟
+    6. آیا عدد یا تاریخ نامطمئن را قطعی نوشته‌ام؟
+    7. آیا خطاهای احتمالی ASR را مشخص کرده‌ام؟
+    8. آیا موارد مبهم را در بخش ابهامات آورده‌ام؟
+    9. آیا خروجی کاملاً فارسی و رسمی است؟
+    10. آیا تمام بخش‌های صورتجلسه بر اساس اطلاعات موجود در
+        Transcript نوشته شده‌اند؟
+
+    اگر پاسخ هرکدام از موارد بالا منفی است، خروجی را قبل از ارائه
+    اصلاح کن.
+
+
+    ============================================================
+    TRANSCRIPT
+    ============================================================
+
+    متن Transcript در پیام بعدی توسط برنامه ارسال خواهد شد.
+
+    فقط بر اساس Transcript دریافت‌شده عمل کن.

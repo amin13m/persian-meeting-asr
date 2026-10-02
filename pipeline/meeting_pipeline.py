@@ -9,7 +9,9 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 
-from engines.audio_chunker import AudioChunker
+from engines.asr_grouping import (
+    ASRGroupingEngine,
+)
 from engines.diarization.engine import (
     DiarizationEngine,
 )
@@ -36,9 +38,9 @@ class MeetingPipeline:
         self.config = config
         self.asr_engine = asr_engine
 
-        self.chunker = AudioChunker(
-            config
-        )
+        # ====================================================
+        # Engines
+        # ====================================================
 
         self.diarization = (
             DiarizationEngine(
@@ -58,6 +60,36 @@ class MeetingPipeline:
                 self.overlap,
             )
         )
+
+        # ====================================================
+        # Dedicated ASR grouping engine
+        # ====================================================
+
+        self.grouping = (
+            ASRGroupingEngine(
+                config
+            )
+        )
+
+        # ====================================================
+        # Audio
+        # ====================================================
+
+        audio_config = config.get(
+            "audio",
+            {},
+        )
+
+        self.target_sample_rate = int(
+            audio_config.get(
+                "sample_rate",
+                16000,
+            )
+        )
+
+        # ====================================================
+        # ASR
+        # ====================================================
 
         asr_config = config.get(
             "asr",
@@ -85,57 +117,20 @@ class MeetingPipeline:
             )
         )
 
-        # ----------------------------------------------------
-        # ASR grouping
-        # ----------------------------------------------------
-
-        grouping = asr_config.get(
-            "grouping",
-            {},
-        )
-
-        self.grouping_enabled = bool(
-            grouping.get(
-                "enabled",
-                True,
-            )
-        )
-
-        self.group_max_gap_seconds = float(
-            grouping.get(
-                "max_gap_seconds",
-                1.50,
-            )
-        )
-
-        self.group_max_chunk_seconds = float(
-            grouping.get(
-                "max_chunk_seconds",
-                self.max_turn_seconds,
-            )
-        )
-
-        self.group_min_seconds = float(
-            grouping.get(
-                "min_group_seconds",
-                0.20,
-            )
-        )
-
-        self.group_preserve_gaps = bool(
-            grouping.get(
-                "preserve_gaps",
-                True,
-            )
-        )
-
-        # ----------------------------------------------------
-        # Debug ASR
-        # ----------------------------------------------------
+        # ====================================================
+        # Debug
+        # ====================================================
 
         debug_cfg = (
-            config.get("debug", {})
-            .get("audio", {})
+            config
+            .get(
+                "debug",
+                {},
+            )
+            .get(
+                "audio",
+                {},
+            )
         )
 
         self.debug_audio_enabled = bool(
@@ -152,18 +147,32 @@ class MeetingPipeline:
             )
         )
 
+        debug_root = debug_cfg.get(
+            "root_dir",
+            "output/debug_audio",
+        )
+
         self.debug_root = Path(
-            debug_cfg.get(
-                "root_dir",
-                "output/debug_audio",
-            )
+            debug_root
+        )
+
+        # ====================================================
+        # Runtime
+        # ====================================================
+
+        self._original_waveform = None
+
+        self._original_sample_rate = (
+            self.target_sample_rate
         )
 
     # ========================================================
     # Lifecycle
     # ========================================================
 
-    def load(self) -> None:
+    def load(
+        self,
+    ) -> None:
 
         logger.info(
             "Loading meeting pipeline..."
@@ -188,7 +197,6 @@ class MeetingPipeline:
 
         try:
             return float(value)
-
         except (
             TypeError,
             ValueError,
@@ -207,23 +215,17 @@ class MeetingPipeline:
             )
         ).strip()
 
-        start = (
-            MeetingPipeline
-            ._safe_float(
-                turn.get(
-                    "start",
-                    0.0,
-                )
+        start = MeetingPipeline._safe_float(
+            turn.get(
+                "start",
+                0.0,
             )
         )
 
-        end = (
-            MeetingPipeline
-            ._safe_float(
-                turn.get(
-                    "end",
-                    0.0,
-                )
+        end = MeetingPipeline._safe_float(
+            turn.get(
+                "end",
+                0.0,
             )
         )
 
@@ -252,27 +254,35 @@ class MeetingPipeline:
             list,
         ):
 
-            raw_turns = diarization[
-                "turns"
-            ]
+            raw_turns = (
+                diarization[
+                    "turns"
+                ]
+            )
 
         elif isinstance(
             diarization.get("segments"),
             list,
         ):
 
-            raw_turns = diarization[
-                "segments"
-            ]
+            raw_turns = (
+                diarization[
+                    "segments"
+                ]
+            )
 
         elif isinstance(
-            diarization.get("diarization"),
+            diarization.get(
+                "diarization"
+            ),
             list,
         ):
 
-            raw_turns = diarization[
-                "diarization"
-            ]
+            raw_turns = (
+                diarization[
+                    "diarization"
+                ]
+            )
 
         normalized = []
 
@@ -291,6 +301,7 @@ class MeetingPipeline:
             )
 
             if turn is not None:
+
                 normalized.append(
                     turn
                 )
@@ -305,244 +316,167 @@ class MeetingPipeline:
         return normalized
 
     # ========================================================
-    # ASR grouping
-    # ========================================================
-
-    def _build_asr_groups(
-        self,
-        turns: list[dict],
-    ) -> list[dict]:
-        """
-        Convert many tiny consecutive turns of the same
-        speaker into larger ASR chunks.
-
-        Example:
-
-            SPEAKER_00  1.1 -> 19.0
-            SPEAKER_00 19.9 -> 20.6
-            SPEAKER_00 20.9 -> 21.4
-
-        becomes:
-
-            SPEAKER_00  1.1 -> 21.4
-
-        if the gaps and maximum chunk duration permit it.
-
-        Original turn indices are preserved.
-        """
-
-        if not turns:
-            return []
-
-        if not self.grouping_enabled:
-
-            return [
-                {
-                    "group_index": index,
-                    "speaker": turn["speaker"],
-                    "start": turn["start"],
-                    "end": turn["end"],
-                    "duration": turn["duration"],
-                    "source_turn_indices": [
-                        index
-                    ],
-                    "source_turns": [
-                        dict(turn)
-                    ],
-                }
-                for index, turn
-                in enumerate(turns)
-            ]
-
-        groups = []
-
-        current = None
-
-        for index, turn in enumerate(
-            turns
-        ):
-
-            if current is None:
-
-                current = {
-                    "group_index": len(
-                        groups
-                    ),
-                    "speaker": turn[
-                        "speaker"
-                    ],
-                    "start": turn[
-                        "start"
-                    ],
-                    "end": turn[
-                        "end"
-                    ],
-                    "duration": turn[
-                        "duration"
-                    ],
-                    "source_turn_indices": [
-                        index
-                    ],
-                    "source_turns": [
-                        dict(turn)
-                    ],
-                }
-
-                continue
-
-            same_speaker = (
-                turn["speaker"]
-                == current["speaker"]
-            )
-
-            gap = (
-                turn["start"]
-                - current["end"]
-            )
-
-            candidate_duration = (
-                turn["end"]
-                - current["start"]
-            )
-
-            can_merge = (
-                same_speaker
-                and gap >= 0.0
-                and gap
-                <= self.group_max_gap_seconds
-                and candidate_duration
-                <= self.group_max_chunk_seconds
-            )
-
-            if can_merge:
-
-                current["end"] = turn[
-                    "end"
-                ]
-
-                current["duration"] = (
-                    current["end"]
-                    - current["start"]
-                )
-
-                current[
-                    "source_turn_indices"
-                ].append(index)
-
-                current[
-                    "source_turns"
-                ].append(
-                    dict(turn)
-                )
-
-            else:
-
-                groups.append(
-                    current
-                )
-
-                current = {
-                    "group_index": len(
-                        groups
-                    ),
-                    "speaker": turn[
-                        "speaker"
-                    ],
-                    "start": turn[
-                        "start"
-                    ],
-                    "end": turn[
-                        "end"
-                    ],
-                    "duration": turn[
-                        "duration"
-                    ],
-                    "source_turn_indices": [
-                        index
-                    ],
-                    "source_turns": [
-                        dict(turn)
-                    ],
-                }
-
-        if current is not None:
-            groups.append(
-                current
-            )
-
-        return groups
-
-    # ========================================================
-    # Audio
+    # Original audio
     # ========================================================
 
     @staticmethod
-    def _extract_segment(
+    def _resample_audio(
         waveform: np.ndarray,
-        sample_rate: int,
-        start: float,
-        end: float,
+        source_rate: int,
+        target_rate: int,
     ) -> np.ndarray:
 
-        if end <= start:
+        if waveform.size == 0:
+
             return np.zeros(
                 0,
                 dtype=np.float32,
             )
 
-        start_sample = int(
+        if source_rate == target_rate:
+
+            return np.ascontiguousarray(
+                waveform,
+                dtype=np.float32,
+            )
+
+        source_length = len(
+            waveform
+        )
+
+        target_length = int(
             round(
-                start
-                * sample_rate
+                source_length
+                * target_rate
+                / source_rate
             )
         )
 
-        end_sample = int(
-            round(
-                end
-                * sample_rate
-            )
-        )
+        if target_length <= 0:
 
-        start_sample = max(
-            0,
-            start_sample,
-        )
-
-        end_sample = min(
-            len(waveform),
-            end_sample,
-        )
-
-        if end_sample <= start_sample:
             return np.zeros(
                 0,
                 dtype=np.float32,
             )
+
+        source_positions = np.linspace(
+            0.0,
+            source_length - 1,
+            num=source_length,
+            dtype=np.float64,
+        )
+
+        target_positions = np.linspace(
+            0.0,
+            source_length - 1,
+            num=target_length,
+            dtype=np.float64,
+        )
+
+        resampled = np.interp(
+            target_positions,
+            source_positions,
+            waveform,
+        )
 
         return np.ascontiguousarray(
-            waveform[
-                start_sample:end_sample
-            ],
+            resampled,
             dtype=np.float32,
         )
 
-    @staticmethod
-    def _is_silent(
-        audio: np.ndarray,
-    ) -> bool:
+    def _load_original_audio(
+        self,
+        audio_path: Path,
+    ) -> tuple[
+        np.ndarray,
+        int,
+    ]:
 
-        if audio.size == 0:
-            return True
+        waveform, sample_rate = sf.read(
+            str(audio_path),
+            always_2d=False,
+            dtype="float32",
+        )
 
-        return float(
-            np.max(
-                np.abs(audio)
+        waveform = np.asarray(
+            waveform,
+            dtype=np.float32,
+        )
+
+        if waveform.ndim > 1:
+
+            waveform = np.mean(
+                waveform,
+                axis=1,
+                dtype=np.float32,
             )
-        ) < 1e-5
+
+        waveform = np.ascontiguousarray(
+            waveform,
+            dtype=np.float32,
+        )
+
+        source_rate = int(
+            sample_rate
+        )
+
+        if (
+            source_rate
+            != self.target_sample_rate
+        ):
+
+            waveform = (
+                self._resample_audio(
+                    waveform,
+                    source_rate,
+                    self.target_sample_rate,
+                )
+            )
+
+            sample_rate = (
+                self.target_sample_rate
+            )
+
+        return (
+            waveform,
+            int(sample_rate),
+        )
 
     # ========================================================
-    # Debug ASR audio
+    # Audio validation / preparation
+    # ========================================================
+
+    def _prepare_group_audio(
+        self,
+        group: dict,
+        waveform: np.ndarray,
+        sample_rate: int,
+    ) -> np.ndarray:
+
+        return self.grouping.build_audio(
+            group,
+            waveform,
+            sample_rate,
+        )
+
+    def _validate_groups(
+        self,
+        groups: list[dict],
+        waveform: np.ndarray,
+        sample_rate: int,
+    ) -> list[dict]:
+
+        return (
+            self.grouping
+            .validate_groups_against_audio(
+                groups,
+                waveform,
+                sample_rate,
+            )
+        )
+
+    # ========================================================
+    # Debug
     # ========================================================
 
     @staticmethod
@@ -550,7 +484,9 @@ class MeetingPipeline:
         value: str,
     ) -> str:
 
-        result = str(value)
+        result = str(
+            value
+        )
 
         for char in (
             "\\",
@@ -563,6 +499,7 @@ class MeetingPipeline:
             ">",
             "|",
         ):
+
             result = result.replace(
                 char,
                 "_",
@@ -581,6 +518,10 @@ class MeetingPipeline:
             self.debug_audio_enabled
             and self.save_asr_debug_audio
         ):
+
+            return None
+
+        if audio.size == 0:
             return None
 
         speaker = self._safe_name(
@@ -602,15 +543,12 @@ class MeetingPipeline:
             exist_ok=True,
         )
 
+        # IMPORTANT:
+        # Save only after validation.
         sf.write(
             str(path),
             audio,
             sample_rate,
-        )
-
-        logger.debug(
-            "Saved ASR debug chunk: %s",
-            path,
         )
 
         return path
@@ -627,32 +565,20 @@ class MeetingPipeline:
         end: float,
     ) -> str:
 
-        duration = end - start
+        duration = (
+            end - start
+        )
 
         if duration <= 0:
             return ""
 
         if (
             duration
-            < self.group_min_seconds
+            < self.grouping.min_group_seconds
         ):
-
             return ""
 
         if audio.size == 0:
-            return ""
-
-        if self._is_silent(
-            audio
-        ):
-
-            logger.debug(
-                "Skipping silent ASR group: "
-                "%.3f -> %.3f",
-                start,
-                end,
-            )
-
             return ""
 
         try:
@@ -698,9 +624,13 @@ class MeetingPipeline:
     def _transcribe_group(
         self,
         group: dict,
-        speaker_waveform: np.ndarray,
+        waveform: np.ndarray,
         sample_rate: int,
-    ) -> tuple[str, Path | None]:
+    ) -> tuple[
+        str,
+        Path | None,
+        np.ndarray,
+    ]:
 
         start = float(
             group["start"]
@@ -711,21 +641,35 @@ class MeetingPipeline:
         )
 
         # ----------------------------------------------------
-        # Timeline-preserving extraction.
+        # Rebuild from source intervals.
         #
-        # Because speaker_waveform contains only this speaker,
-        # any speech belonging to other speakers is zero.
+        # We intentionally do NOT simply crop
+        # waveform[start:end].
+        #
+        # This prevents ignored short speaker turns from
+        # leaking into the ASR group.
         # ----------------------------------------------------
 
-        audio = self._extract_segment(
-            speaker_waveform,
-            sample_rate,
-            start,
-            end,
+        audio = (
+            self._prepare_group_audio(
+                group,
+                waveform,
+                sample_rate,
+            )
         )
 
         if audio.size == 0:
-            return "", None
+
+            return (
+                "",
+                None,
+                audio,
+            )
+
+        # ----------------------------------------------------
+        # Debug WAV is written ONLY here, after grouping
+        # validation has already succeeded.
+        # ----------------------------------------------------
 
         debug_path = (
             self._save_asr_chunk(
@@ -735,14 +679,63 @@ class MeetingPipeline:
             )
         )
 
-        text = self._transcribe_audio(
-            audio,
-            sample_rate,
-            start,
-            end,
+        text = (
+            self._transcribe_audio(
+                audio,
+                sample_rate,
+                start,
+                end,
+            )
         )
 
-        return text, debug_path
+        return (
+            text,
+            debug_path,
+            audio,
+        )
+
+    # ========================================================
+    # Group logging
+    # ========================================================
+
+    def _log_grouping_stats(
+        self,
+        raw_turns: list[dict],
+        groups: list[dict],
+    ) -> None:
+
+        stats = (
+            self.grouping.last_stats
+        )
+
+        logger.info(
+            "ASR grouping: "
+            "raw_turns=%d | "
+            "ignored_short=%d | "
+            "candidate_groups=%d | "
+            "rejected=%d | "
+            "valid_groups=%d",
+            len(raw_turns),
+            int(
+                stats.get(
+                    "ignored_short_turns",
+                    0,
+                )
+            ),
+            int(
+                stats.get(
+                    "groups_before_audio_validation",
+                    0,
+                )
+            ),
+            int(
+                stats.get(
+                    "groups_rejected",
+                    0,
+                )
+            ),
+            len(groups),
+        )
 
     # ========================================================
     # Process
@@ -783,6 +776,8 @@ class MeetingPipeline:
             "=" * 70
         )
 
+        self._original_waveform = None
+
         # ====================================================
         # 1. Diarization
         # ====================================================
@@ -809,7 +804,7 @@ class MeetingPipeline:
         )
 
         # ====================================================
-        # 2. Speaker isolation + TSE
+        # 2. Isolation + TSE
         # ====================================================
 
         logger.info(
@@ -830,25 +825,55 @@ class MeetingPipeline:
             )
         )
 
-        speaker_audio = (
-            self.isolation
-            .get_all_speaker_audio()
-        )
-
-        isolation_sample_rate = int(
-            isolation.get(
-                "audio",
-                {},
-            ).get(
-                "sample_rate",
-                16000,
+        isolation_enabled = bool(
+            getattr(
+                self.isolation,
+                "enabled",
+                True,
             )
         )
 
-        logger.info(
-            "Speaker timelines available: %d",
-            len(speaker_audio),
+        tse_enabled = bool(
+            getattr(
+                self.overlap,
+                "enabled",
+                False,
+            )
         )
+
+        speaker_audio = {}
+
+        isolation_sample_rate = (
+            self.target_sample_rate
+        )
+
+        if isolation_enabled:
+
+            speaker_audio = (
+                self.isolation
+                .get_all_speaker_audio()
+            )
+
+            isolation_sample_rate = int(
+                isolation.get(
+                    "audio",
+                    {},
+                ).get(
+                    "sample_rate",
+                    self.target_sample_rate,
+                )
+            )
+
+        else:
+
+            (
+                self._original_waveform,
+                self._original_sample_rate,
+            ) = (
+                self._load_original_audio(
+                    audio_path
+                )
+            )
 
         # ====================================================
         # 3. Build ASR groups
@@ -858,10 +883,138 @@ class MeetingPipeline:
             "[3/4] Building ASR groups"
         )
 
-        asr_groups = (
-            self._build_asr_groups(
+        candidate_groups = (
+            self.grouping.build_groups(
                 turns
             )
+        )
+
+        # ----------------------------------------------------
+        # Determine audio source BEFORE validation.
+        #
+        # This is critical:
+        # validation must inspect the actual waveform that
+        # Whisper will receive.
+        # ----------------------------------------------------
+
+        if isolation_enabled:
+
+            validation_waveforms = (
+                speaker_audio
+            )
+
+            validation_sample_rate = (
+                isolation_sample_rate
+            )
+
+        else:
+
+            validation_waveforms = {
+                "__original__": (
+                    self._original_waveform
+                )
+            }
+
+            validation_sample_rate = (
+                self._original_sample_rate
+            )
+
+        # ----------------------------------------------------
+        # Validate each group against its real audio source.
+        # ----------------------------------------------------
+
+        valid_groups = []
+
+        for group in candidate_groups:
+
+            speaker = group[
+                "speaker"
+            ]
+
+            if isolation_enabled:
+
+                waveform = (
+                    validation_waveforms.get(
+                        speaker
+                    )
+                )
+
+            else:
+
+                waveform = (
+                    validation_waveforms.get(
+                        "__original__"
+                    )
+                )
+
+            if waveform is None:
+
+                logger.warning(
+                    "Rejecting ASR group %03d: "
+                    "no waveform for speaker %s",
+                    int(
+                        group.get(
+                            "group_index",
+                            -1,
+                        )
+                    ),
+                    speaker,
+                )
+
+                self.grouping.last_stats[
+                    "groups_rejected"
+                ] += 1
+
+                continue
+
+            validated = (
+                self.grouping
+                .validate_groups_against_audio(
+                    [group],
+                    waveform,
+                    validation_sample_rate,
+                )
+            )
+
+            if validated:
+
+                valid_groups.append(
+                    validated[0]
+                )
+
+        # ----------------------------------------------------
+        # Re-index ONLY valid groups.
+        #
+        # This eliminates:
+        #
+        # group_036.wav
+        # group_037.wav   <- rejected
+        # group_038.wav
+        #
+        # and gives:
+        #
+        # group_036.wav
+        # group_037.wav
+        # group_038.wav
+        # ----------------------------------------------------
+
+        for index, group in enumerate(
+            valid_groups
+        ):
+
+            group[
+                "group_index"
+            ] = index
+
+        asr_groups = valid_groups
+
+        self.grouping.last_stats[
+            "groups_output"
+        ] = len(asr_groups)
+
+        self._log_grouping_stats(
+            turns,
+            asr_groups,
         )
 
         logger.info(
@@ -873,9 +1026,9 @@ class MeetingPipeline:
 
         conversation_turns = []
 
-        # ----------------------------------------------------
-        # ASR groups
-        # ----------------------------------------------------
+        # ====================================================
+        # Transcribe groups
+        # ====================================================
 
         for group in asr_groups:
 
@@ -901,45 +1054,172 @@ class MeetingPipeline:
                 ]
             )
 
+            ignored_indices = list(
+                group.get(
+                    "ignored_turn_indices",
+                    [],
+                )
+            )
+
             logger.info(
-                "ASR group %d: %s "
+                "ASR group %03d: %s "
                 "[%.3f -> %.3f] "
-                "(%.3fs) | source turns=%s",
+                "(%.3fs) | "
+                "source=%s | "
+                "ignored=%s",
                 group["group_index"],
                 speaker,
                 start,
                 end,
                 duration,
                 source_indices,
+                ignored_indices,
             )
 
-            speaker_waveform = (
-                speaker_audio.get(
-                    speaker
-                )
-            )
-
+            text = ""
             debug_path = None
+            actual_audio_duration = 0.0
+            audio_rms = 0.0
+            audio_active_ratio = 0.0
 
-            if speaker_waveform is None:
+            # ------------------------------------------------
+            # Speaker isolated mode
+            # ------------------------------------------------
 
-                logger.warning(
-                    "No isolated timeline "
-                    "for speaker %s",
-                    speaker,
+            if isolation_enabled:
+
+                speaker_waveform = (
+                    speaker_audio.get(
+                        speaker
+                    )
                 )
 
-                text = ""
+                if (
+                    speaker_waveform
+                    is None
+                ):
+
+                    logger.warning(
+                        "No isolated timeline "
+                        "for speaker %s",
+                        speaker,
+                    )
+
+                else:
+
+                    (
+                        text,
+                        debug_path,
+                        audio,
+                    ) = (
+                        self._transcribe_group(
+                            group,
+                            speaker_waveform,
+                            isolation_sample_rate,
+                        )
+                    )
+
+                    if audio.size:
+
+                        actual_audio_duration = (
+                            audio.size
+                            / isolation_sample_rate
+                        )
+
+                        audio_rms = float(
+                            np.sqrt(
+                                np.mean(
+                                    np.square(
+                                        audio.astype(
+                                            np.float64
+                                        )
+                                    )
+                                )
+                            )
+                        )
+
+                        audio_active_ratio = float(
+                            np.mean(
+                                np.abs(audio)
+                                > max(
+                                    1e-6,
+                                    float(
+                                        np.max(
+                                            np.abs(
+                                                audio
+                                            )
+                                        )
+                                    )
+                                    * 0.05,
+                                )
+                            )
+                        )
+
+            # ------------------------------------------------
+            # Original audio mode
+            # ------------------------------------------------
 
             else:
 
-                text, debug_path = (
-                    self._transcribe_group(
-                        group,
-                        speaker_waveform,
-                        isolation_sample_rate,
+                if (
+                    self._original_waveform
+                    is None
+                ):
+
+                    logger.error(
+                        "Original ASR waveform "
+                        "is unavailable."
                     )
-                )
+
+                else:
+
+                    (
+                        text,
+                        debug_path,
+                        audio,
+                    ) = (
+                        self._transcribe_group(
+                            group,
+                            self._original_waveform,
+                            self._original_sample_rate,
+                        )
+                    )
+
+                    if audio.size:
+
+                        actual_audio_duration = (
+                            audio.size
+                            / self._original_sample_rate
+                        )
+
+                        audio_rms = float(
+                            np.sqrt(
+                                np.mean(
+                                    np.square(
+                                        audio.astype(
+                                            np.float64
+                                        )
+                                    )
+                                )
+                            )
+                        )
+
+                        audio_active_ratio = float(
+                            np.mean(
+                                np.abs(audio)
+                                > max(
+                                    1e-6,
+                                    float(
+                                        np.max(
+                                            np.abs(
+                                                audio
+                                            )
+                                        )
+                                    )
+                                    * 0.05,
+                                )
+                            )
+                        )
 
             conversation_turns.append(
                 {
@@ -964,10 +1244,29 @@ class MeetingPipeline:
                         3,
                     ),
 
+                    "actual_audio_duration": round(
+                        actual_audio_duration,
+                        3,
+                    ),
+
+                    "audio_rms": round(
+                        audio_rms,
+                        7,
+                    ),
+
+                    "audio_active_ratio": round(
+                        audio_active_ratio,
+                        5,
+                    ),
+
                     "text": text,
 
                     "source_turn_indices": (
                         source_indices
+                    ),
+
+                    "ignored_turn_indices": (
+                        ignored_indices
                     ),
 
                     "source_turns": [
@@ -975,6 +1274,7 @@ class MeetingPipeline:
                             "speaker": item[
                                 "speaker"
                             ],
+
                             "start": round(
                                 float(
                                     item[
@@ -983,6 +1283,7 @@ class MeetingPipeline:
                                 ),
                                 3,
                             ),
+
                             "end": round(
                                 float(
                                     item[
@@ -991,6 +1292,7 @@ class MeetingPipeline:
                                 ),
                                 3,
                             ),
+
                             "duration": round(
                                 float(
                                     item[
@@ -1000,13 +1302,56 @@ class MeetingPipeline:
                                 3,
                             ),
                         }
-                        for item in group[
+                        for item
+                        in group[
                             "source_turns"
                         ]
                     ],
 
+                    "ignored_turns": [
+                        {
+                            "speaker": item[
+                                "speaker"
+                            ],
+
+                            "start": round(
+                                float(
+                                    item[
+                                        "start"
+                                    ]
+                                ),
+                                3,
+                            ),
+
+                            "end": round(
+                                float(
+                                    item[
+                                        "end"
+                                    ]
+                                ),
+                                3,
+                            ),
+
+                            "duration": round(
+                                float(
+                                    item[
+                                        "duration"
+                                    ]
+                                ),
+                                3,
+                            ),
+                        }
+                        for item
+                        in group.get(
+                            "ignored_turns",
+                            [],
+                        )
+                    ],
+
                     "debug_audio": (
-                        str(debug_path)
+                        str(
+                            debug_path
+                        )
                         if debug_path
                         else None
                     ),
@@ -1014,30 +1359,21 @@ class MeetingPipeline:
             )
 
         # ====================================================
-        # Speaker transcriptions
+        # Speaker transcription
         # ====================================================
 
         speaker_transcriptions = {}
 
-        for item in (
-            conversation_turns
-        ):
+        for item in conversation_turns:
 
             speaker = item[
                 "speaker"
             ]
 
-            if speaker not in (
-                speaker_transcriptions
-            ):
-
-                speaker_transcriptions[
-                    speaker
-                ] = []
-
-            speaker_transcriptions[
-                speaker
-            ].append(
+            speaker_transcriptions.setdefault(
+                speaker,
+                [],
+            ).append(
                 {
                     "group_index": item[
                         "group_index"
@@ -1059,16 +1395,14 @@ class MeetingPipeline:
                         "text"
                     ],
 
-                    "source_turn_indices": (
-                        item[
-                            "source_turn_indices"
-                        ]
-                    ),
+                    "source_turn_indices": item[
+                        "source_turn_indices"
+                    ],
                 }
             )
 
         # ====================================================
-        # 4. Final JSON
+        # 4. Result
         # ====================================================
 
         logger.info(
@@ -1079,6 +1413,54 @@ class MeetingPipeline:
             time.perf_counter()
             - file_start
         )
+
+        if isolation_enabled:
+
+            transcription_mode = (
+                "speaker_isolated_grouped_asr"
+            )
+
+            asr_source = (
+                "isolated_speaker_timeline"
+            )
+
+            isolation_strategy = (
+                "speaker_timeline"
+            )
+
+        else:
+
+            transcription_mode = (
+                "diarized_original_audio_grouped_asr"
+            )
+
+            asr_source = (
+                "original_normalized_audio"
+            )
+
+            isolation_strategy = (
+                "disabled_original_audio"
+            )
+
+        if tse_enabled:
+
+            overlap_strategy = (
+                "REAL-T_target_speaker_extraction"
+            )
+
+            tse_source = (
+                "overlap_regions_only"
+            )
+
+        else:
+
+            overlap_strategy = (
+                "disabled"
+            )
+
+            tse_source = (
+                "none"
+            )
 
         result = {
 
@@ -1105,37 +1487,47 @@ class MeetingPipeline:
 
             "transcription": {
 
-                # New grouped ASR output.
                 "turns": conversation_turns,
 
-                # Original diarization turns.
                 "raw_turns": [
                     {
                         "turn_index": index,
+
                         "speaker": turn[
                             "speaker"
                         ],
+
                         "start": round(
                             float(
-                                turn["start"]
+                                turn[
+                                    "start"
+                                ]
                             ),
                             3,
                         ),
+
                         "end": round(
                             float(
-                                turn["end"]
+                                turn[
+                                    "end"
+                                ]
                             ),
                             3,
                         ),
+
                         "duration": round(
                             float(
-                                turn["duration"]
+                                turn[
+                                    "duration"
+                                ]
                             ),
                             3,
                         ),
                     }
                     for index, turn
-                    in enumerate(turns)
+                    in enumerate(
+                        turns
+                    )
                 ],
 
                 "speakers": (
@@ -1143,20 +1535,147 @@ class MeetingPipeline:
                 ),
 
                 "grouping": {
+
                     "enabled": (
-                        self.grouping_enabled
+                        self.grouping.enabled
                     ),
+
                     "max_gap_seconds": (
-                        self.group_max_gap_seconds
+                        self.grouping
+                        .max_gap_seconds
                     ),
+
                     "max_chunk_seconds": (
-                        self.group_max_chunk_seconds
+                        self.grouping
+                        .max_chunk_seconds
                     ),
-                    "group_count": len(
-                        asr_groups
+
+                    "min_group_seconds": (
+                        self.grouping
+                        .min_group_seconds
                     ),
-                    "raw_turn_count": len(
-                        turns
+
+                    "preserve_gaps": (
+                        self.grouping
+                        .preserve_gaps
+                    ),
+
+                    "short_turn_filter": {
+
+                        "enabled": (
+                            self.grouping
+                            .short_turn_filter_enabled
+                        ),
+
+                        "ignore_below_seconds": (
+                            self.grouping
+                            .ignore_below_seconds
+                        ),
+
+                        "bridge_same_speaker": (
+                            self.grouping
+                            .bridge_same_speaker
+                        ),
+
+                        "bridge_max_gap_seconds": (
+                            self.grouping
+                            .bridge_max_gap_seconds
+                        ),
+                    },
+
+                    "overlap_filter": {
+
+                        "enabled": (
+                            self.grouping
+                            .overlap_filter_enabled
+                        ),
+
+                        "ignore_below_seconds": (
+                            self.grouping
+                            .ignore_overlap_below_seconds
+                        ),
+
+                        "do_not_break_group": (
+                            self.grouping
+                            .do_not_break_on_short_overlap
+                        ),
+                    },
+
+                    "noise_filter": {
+
+                        "enabled": (
+                            self.grouping
+                            .noise_filter_enabled
+                        ),
+
+                        "max_noise_turn_seconds": (
+                            self.grouping
+                            .max_noise_turn_seconds
+                        ),
+
+                        "min_rms": (
+                            self.grouping
+                            .min_rms
+                        ),
+
+                        "min_active_ratio": (
+                            self.grouping
+                            .min_active_ratio
+                        ),
+                    },
+
+                    "audio_validation": {
+
+                        "enabled": (
+                            self.grouping
+                            .audio_validation_enabled
+                        ),
+
+                        "min_audio_seconds": (
+                            self.grouping
+                            .min_audio_seconds
+                        ),
+
+                        "min_active_ratio": (
+                            self.grouping
+                            .validation_min_active_ratio
+                        ),
+
+                        "reject_silence_only": (
+                            self.grouping
+                            .reject_silence_only
+                        ),
+
+                        "reject_noise_only": (
+                            self.grouping
+                            .reject_noise_only
+                        ),
+                    },
+
+                    "group_count": (
+                        len(asr_groups)
+                    ),
+
+                    "raw_turn_count": (
+                        len(turns)
+                    ),
+
+                    "ignored_short_turns": int(
+                        self.grouping
+                        .last_stats
+                        .get(
+                            "ignored_short_turns",
+                            0,
+                        )
+                    ),
+
+                    "rejected_groups": int(
+                        self.grouping
+                        .last_stats
+                        .get(
+                            "groups_rejected",
+                            0,
+                        )
                     ),
                 },
             },
@@ -1169,23 +1688,35 @@ class MeetingPipeline:
                 ),
 
                 "transcription_mode": (
-                    "speaker_isolated_grouped_asr"
+                    transcription_mode
+                ),
+
+                "isolation_strategy": (
+                    isolation_strategy
                 ),
 
                 "overlap_strategy": (
-                    "REAL-T_target_speaker_extraction"
+                    overlap_strategy
                 ),
 
                 "asr_source": (
-                    "isolated_speaker_timeline"
+                    asr_source
                 ),
 
                 "tse_source": (
-                    "overlap_regions_only"
+                    tse_source
+                ),
+
+                "speaker_isolation_enabled": (
+                    isolation_enabled
+                ),
+
+                "overlap_separation_enabled": (
+                    tse_enabled
                 ),
 
                 "asr_grouping": (
-                    self.grouping_enabled
+                    self.grouping.enabled
                 ),
             },
         }
@@ -1214,9 +1745,7 @@ class MeetingPipeline:
 
         txt_lines = []
 
-        for item in (
-            conversation_turns
-        ):
+        for item in conversation_turns:
 
             text = str(
                 item.get(
@@ -1270,8 +1799,48 @@ class MeetingPipeline:
         )
 
         logger.info(
-            "ASR groups: %d",
-            len(conversation_turns),
+            "Ignored short turns: %d",
+            int(
+                self.grouping
+                .last_stats
+                .get(
+                    "ignored_short_turns",
+                    0,
+                )
+            ),
+        )
+
+        logger.info(
+            "Rejected groups: %d",
+            int(
+                self.grouping
+                .last_stats
+                .get(
+                    "groups_rejected",
+                    0,
+                )
+            ),
+        )
+
+        logger.info(
+            "Valid ASR groups: %d",
+            len(
+                conversation_turns
+            ),
+        )
+
+        logger.info(
+            "Transcribed groups: %d",
+            sum(
+                bool(
+                    item.get(
+                        "text",
+                        "",
+                    ).strip()
+                )
+                for item
+                in conversation_turns
+            ),
         )
 
         logger.info(
@@ -1285,11 +1854,15 @@ class MeetingPipeline:
     # Unload
     # ========================================================
 
-    def unload(self) -> None:
+    def unload(
+        self,
+    ) -> None:
 
         logger.info(
             "Unloading meeting pipeline..."
         )
+
+        self._original_waveform = None
 
         self.isolation.clear_audio_buffers()
 

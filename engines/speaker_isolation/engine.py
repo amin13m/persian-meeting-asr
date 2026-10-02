@@ -28,20 +28,9 @@ class SpeakerIsolationEngine:
                                                      v
                                            speaker timeline
 
-    The generated timeline has exactly the same duration and
-    sample alignment as the original normalized audio.
+    TSE is executed ONLY on overlap regions.
 
-    IMPORTANT:
-        TSE is executed ONLY on overlap regions.
-        The full meeting audio is NEVER passed to TSE.
-
-    New debug/reference functionality:
-
-        clean speech
-             |
-             +--> speaker reference WAV
-             |
-             +--> isolated speaker timeline
+    Speaker references are created ONLY from clean speech.
     """
 
     def __init__(
@@ -51,6 +40,10 @@ class SpeakerIsolationEngine:
     ):
         self.config = config
         self.overlap_engine = overlap_engine
+
+        # ====================================================
+        # Audio
+        # ====================================================
 
         self.sample_rate = int(
             config.get(
@@ -62,9 +55,20 @@ class SpeakerIsolationEngine:
             )
         )
 
+        # ====================================================
+        # Speaker isolation
+        # ====================================================
+
         isolation_config = config.get(
             "speaker_isolation",
             {},
+        )
+
+        self.enabled = bool(
+            isolation_config.get(
+                "enabled",
+                True,
+            )
         )
 
         self.preserve_timeline = bool(
@@ -113,13 +117,19 @@ class SpeakerIsolationEngine:
         )
 
         # ====================================================
-        # Debug audio
+        # Debug
         # ====================================================
 
         debug_config = (
             config
-            .get("debug", {})
-            .get("audio", {})
+            .get(
+                "debug",
+                {},
+            )
+            .get(
+                "audio",
+                {},
+            )
         )
 
         self.debug_audio_enabled = bool(
@@ -129,13 +139,11 @@ class SpeakerIsolationEngine:
             )
         )
 
-        debug_root = debug_config.get(
-            "root_dir",
-            "output/debug_audio",
-        )
-
         self.debug_root_dir = Path(
-            debug_root
+            debug_config.get(
+                "root_dir",
+                "output/debug_audio",
+            )
         )
 
         self.save_speaker_references = bool(
@@ -145,18 +153,23 @@ class SpeakerIsolationEngine:
             )
         )
 
-        # Internal in-memory speaker timelines.
+        # ====================================================
+        # Runtime
+        # ====================================================
+
         self._speaker_audio: dict[
             str,
             np.ndarray,
         ] = {}
 
-        self._audio_duration: float = 0.0
+        self._audio_duration = 0.0
 
         logger.info(
             "SpeakerIsolationEngine initialized | "
-            "sample_rate=%d | preserve_timeline=%s | "
-            "auto_references=%s | debug_audio=%s",
+            "enabled=%s | sample_rate=%d | "
+            "timeline=%s | auto_refs=%s | "
+            "debug=%s",
+            self.enabled,
             self.sample_rate,
             self.preserve_timeline,
             self.auto_create_references,
@@ -164,7 +177,7 @@ class SpeakerIsolationEngine:
         )
 
     # ========================================================
-    # Public access to in-memory timelines
+    # Public
     # ========================================================
 
     def get_speaker_audio(
@@ -182,7 +195,9 @@ class SpeakerIsolationEngine:
 
         return self._speaker_audio
 
-    def clear_audio_buffers(self) -> None:
+    def clear_audio_buffers(
+        self,
+    ) -> None:
 
         self._speaker_audio.clear()
 
@@ -215,8 +230,8 @@ class SpeakerIsolationEngine:
 
         return value
 
+    @staticmethod
     def _ensure_directory(
-        self,
         path: Path,
     ) -> None:
 
@@ -246,6 +261,7 @@ class SpeakerIsolationEngine:
         )
 
         if waveform.ndim == 2:
+
             waveform = np.mean(
                 waveform,
                 axis=1,
@@ -340,7 +356,7 @@ class SpeakerIsolationEngine:
         )
 
     # ========================================================
-    # Diarization normalization
+    # Diarization
     # ========================================================
 
     @staticmethod
@@ -480,7 +496,7 @@ class SpeakerIsolationEngine:
         )
 
     # ========================================================
-    # Interval helpers
+    # Intervals
     # ========================================================
 
     @staticmethod
@@ -618,29 +634,19 @@ class SpeakerIsolationEngine:
 
         for turn in turns:
 
-            speaker = turn["speaker"]
-
-            start = float(
-                turn["start"]
-            )
-
-            end = float(
-                turn["end"]
-            )
-
             events.append(
                 (
-                    start,
+                    float(turn["start"]),
                     1,
-                    speaker,
+                    turn["speaker"],
                 )
             )
 
             events.append(
                 (
-                    end,
+                    float(turn["end"]),
                     -1,
-                    speaker,
+                    turn["speaker"],
                 )
             )
 
@@ -655,11 +661,9 @@ class SpeakerIsolationEngine:
         )
 
         active = set()
-
         regions = []
 
         previous_time = events[0][0]
-
         index = 0
 
         while index < len(events):
@@ -817,7 +821,7 @@ class SpeakerIsolationEngine:
         )
 
     # ========================================================
-    # Timeline operations
+    # Timeline
     # ========================================================
 
     def _write_interval(
@@ -917,7 +921,7 @@ class SpeakerIsolationEngine:
         ] = audio
 
     # ========================================================
-    # Speaker reference creation
+    # Speaker reference
     # ========================================================
 
     def _build_reference_audio(
@@ -939,8 +943,13 @@ class SpeakerIsolationEngine:
             * self.sample_rate
         )
 
-        pieces = []
+        if max_samples <= 0:
+            return np.zeros(
+                0,
+                dtype=np.float32,
+            )
 
+        pieces = []
         collected = 0
 
         for start, end in clean_intervals:
@@ -1010,6 +1019,46 @@ class SpeakerIsolationEngine:
             dtype=np.float32,
         )
 
+    def _save_debug_reference(
+        self,
+        speaker: str,
+        reference_audio: np.ndarray,
+    ) -> Path | None:
+
+        if not (
+            self.debug_audio_enabled
+            and self.save_speaker_references
+        ):
+            return None
+
+        safe_speaker = (
+            self._safe_filename(
+                speaker
+            )
+        )
+
+        debug_dir = (
+            self.debug_root_dir
+            / "speaker_references"
+        )
+
+        self._ensure_directory(
+            debug_dir
+        )
+
+        path = (
+            debug_dir
+            / f"{safe_speaker}.wav"
+        )
+
+        sf.write(
+            str(path),
+            reference_audio,
+            self.sample_rate,
+        )
+
+        return path
+
     def _create_speaker_reference(
         self,
         speaker: str,
@@ -1032,11 +1081,14 @@ class SpeakerIsolationEngine:
             / self.sample_rate
         )
 
-        if duration < self.reference_min_seconds:
+        if (
+            duration
+            < self.reference_min_seconds
+        ):
 
             logger.warning(
                 "Reference not created for %s: "
-                "only %.3fs clean audio available.",
+                "only %.3fs clean speech available.",
                 speaker,
                 duration,
             )
@@ -1058,6 +1110,7 @@ class SpeakerIsolationEngine:
             / f"{safe_speaker}.wav"
         )
 
+        # Existing reference.
         if (
             reference_path.exists()
             and not self.overwrite_references
@@ -1067,6 +1120,34 @@ class SpeakerIsolationEngine:
                 "Using existing speaker reference: %s",
                 reference_path,
             )
+
+            # Still create debug copy when requested.
+            existing_audio, existing_sr = (
+                sf.read(
+                    str(reference_path),
+                    dtype="float32",
+                    always_2d=False,
+                )
+            )
+
+            if existing_sr != self.sample_rate:
+
+                logger.warning(
+                    "Existing reference for %s has "
+                    "sample rate %d instead of %d.",
+                    speaker,
+                    existing_sr,
+                    self.sample_rate,
+                )
+
+            if self.debug_audio_enabled:
+                self._save_debug_reference(
+                    speaker,
+                    np.asarray(
+                        existing_audio,
+                        dtype=np.float32,
+                    ),
+                )
 
             return reference_path
 
@@ -1083,36 +1164,10 @@ class SpeakerIsolationEngine:
             duration,
         )
 
-        # Optional second debug copy.
-        if (
-            self.debug_audio_enabled
-            and self.save_speaker_references
-        ):
-
-            debug_dir = (
-                self.debug_root_dir
-                / "speaker_references"
-            )
-
-            self._ensure_directory(
-                debug_dir
-            )
-
-            debug_path = (
-                debug_dir
-                / f"{safe_speaker}.wav"
-            )
-
-            sf.write(
-                str(debug_path),
-                reference_audio,
-                self.sample_rate,
-            )
-
-            logger.debug(
-                "Debug speaker reference: %s",
-                debug_path,
-            )
+        self._save_debug_reference(
+            speaker,
+            reference_audio,
+        )
 
         return reference_path
 
@@ -1131,10 +1186,41 @@ class SpeakerIsolationEngine:
             audio_path
         )
 
-        logger.info(
-            "Speaker isolation: %s",
-            audio_path.name,
-        )
+        # ====================================================
+        # HARD DISABLE
+        # ====================================================
+
+        if not self.enabled:
+
+            logger.info(
+                "Speaker isolation disabled. "
+                "Skipping: %s",
+                audio_path.name,
+            )
+
+            self.clear_audio_buffers()
+            self._audio_duration = 0.0
+
+            return {
+                "enabled": False,
+                "processed": False,
+                "reason": "disabled",
+                "audio": {
+                    "source": str(
+                        audio_path
+                    ),
+                },
+                "speakers": {},
+                "overlap": {
+                    "count": 0,
+                    "duration": 0.0,
+                    "regions": [],
+                },
+            }
+
+        # ====================================================
+        # Audio
+        # ====================================================
 
         self.clear_audio_buffers()
 
@@ -1152,6 +1238,10 @@ class SpeakerIsolationEngine:
         )
 
         self._audio_duration = duration
+
+        # ====================================================
+        # Diarization
+        # ====================================================
 
         turns = self._get_turns(
             diarization
@@ -1186,7 +1276,7 @@ class SpeakerIsolationEngine:
             )
 
         # ====================================================
-        # Effective reference directory
+        # Reference directory
         # ====================================================
 
         effective_references_dir = (
@@ -1194,8 +1284,7 @@ class SpeakerIsolationEngine:
         )
 
         if (
-            effective_references_dir
-            is None
+            effective_references_dir is None
             and self.auto_create_references
         ):
 
@@ -1213,10 +1302,7 @@ class SpeakerIsolationEngine:
                     / "references"
                 )
 
-        if (
-            effective_references_dir
-            is not None
-        ):
+        if effective_references_dir is not None:
 
             self._ensure_directory(
                 effective_references_dir
@@ -1252,19 +1338,19 @@ class SpeakerIsolationEngine:
 
             overlap_duration = sum(
                 region["duration"]
-                for region in speaker_overlap
+                for region
+                in speaker_overlap
             )
 
-            # ----------------------------------------------
-            # Speaker reference
-            # ----------------------------------------------
+            # ------------------------------------------------
+            # Reference
+            # ------------------------------------------------
 
             reference_file = None
 
             if (
                 self.auto_create_references
-                and effective_references_dir
-                is not None
+                and effective_references_dir is not None
             ):
 
                 reference_file = (
@@ -1276,22 +1362,20 @@ class SpeakerIsolationEngine:
                     )
                 )
 
-            # ----------------------------------------------
-            # Create timeline
-            # ----------------------------------------------
+            # ------------------------------------------------
+            # Timeline
+            # ------------------------------------------------
 
             isolated_audio = np.zeros(
                 len(waveform),
                 dtype=np.float32,
             )
 
-            # ----------------------------------------------
-            # Copy clean speech
-            # ----------------------------------------------
+            # ------------------------------------------------
+            # Clean speech
+            # ------------------------------------------------
 
-            for start, end in (
-                clean_intervals
-            ):
+            for start, end in clean_intervals:
 
                 self._write_interval(
                     isolated_audio,
@@ -1300,20 +1384,26 @@ class SpeakerIsolationEngine:
                     end,
                 )
 
-            # ----------------------------------------------
-            # REAL-T / TSE
-            # ----------------------------------------------
+            # ------------------------------------------------
+            # TSE
+            # ------------------------------------------------
 
             processed_overlap_count = 0
 
-            if speaker_overlap:
-
-                logger.info(
-                    "TSE [%s]: processing %d "
-                    "overlap regions",
-                    speaker,
-                    len(speaker_overlap),
+            tse_enabled = bool(
+                self.overlap_engine is not None
+                and getattr(
+                    self.overlap_engine,
+                    "enabled",
+                    False,
                 )
+            )
+
+            if (
+                tse_enabled
+                and speaker_overlap
+                and reference_file is not None
+            ):
 
                 try:
 
@@ -1345,9 +1435,21 @@ class SpeakerIsolationEngine:
                     "regions": []
                 }
 
-            # ----------------------------------------------
-            # Insert TSE output
-            # ----------------------------------------------
+                if (
+                    speaker_overlap
+                    and tse_enabled
+                    and reference_file is None
+                ):
+
+                    logger.warning(
+                        "TSE skipped for %s because "
+                        "speaker reference is unavailable.",
+                        speaker,
+                    )
+
+            # ------------------------------------------------
+            # Insert TSE
+            # ------------------------------------------------
 
             for region_result in (
                 overlap_result.get(
@@ -1396,9 +1498,9 @@ class SpeakerIsolationEngine:
                         speaker,
                     )
 
-            # ----------------------------------------------
-            # Save timeline
-            # ----------------------------------------------
+            # ------------------------------------------------
+            # Save speaker timeline
+            # ------------------------------------------------
 
             output_file = None
 
@@ -1421,9 +1523,9 @@ class SpeakerIsolationEngine:
                     self.sample_rate,
                 )
 
-            # ----------------------------------------------
-            # Store in memory
-            # ----------------------------------------------
+            # ------------------------------------------------
+            # Memory
+            # ------------------------------------------------
 
             self._speaker_audio[
                 speaker
@@ -1432,9 +1534,9 @@ class SpeakerIsolationEngine:
                 dtype=np.float32,
             )
 
-            # ----------------------------------------------
+            # ------------------------------------------------
             # Metadata
-            # ----------------------------------------------
+            # ------------------------------------------------
 
             speaker_results[speaker] = {
 
@@ -1505,7 +1607,8 @@ class SpeakerIsolationEngine:
                             region["speakers"]
                         ),
                     }
-                    for region in speaker_overlap
+                    for region
+                    in speaker_overlap
                 ],
 
                 "overlap_processed": (
@@ -1523,7 +1626,7 @@ class SpeakerIsolationEngine:
                 ),
 
                 "timeline_preserved": (
-                    True
+                    self.preserve_timeline
                 ),
 
                 "sample_rate": (
@@ -1554,6 +1657,9 @@ class SpeakerIsolationEngine:
             )
 
         return {
+            "enabled": True,
+            "processed": True,
+
             "audio": {
                 "source": str(
                     audio_path

@@ -21,12 +21,11 @@ class OverlapSeparationEngine:
     """
     REAL-T / WeSep based target speaker extraction.
 
-    IMPORTANT:
-        TSE is executed ONLY on overlap regions.
+    TSE is executed ONLY on overlap regions.
 
     The complete meeting audio is NEVER sent to TSE.
 
-    Debug audio can be enabled from:
+    Debug audio can be enabled through:
 
         debug:
           audio:
@@ -38,7 +37,10 @@ class OverlapSeparationEngine:
             keep_tse_temp: true
     """
 
-    def __init__(self, config: dict):
+    def __init__(
+        self,
+        config: dict,
+    ):
         self.config = config
 
         cfg = config.get(
@@ -47,17 +49,21 @@ class OverlapSeparationEngine:
         )
 
         debug_cfg = (
-            config.get("debug", {})
+            config
+            .get("debug", {})
             .get("audio", {})
         )
 
         self.enabled = bool(
-            cfg.get("enabled", True)
+            cfg.get(
+                "enabled",
+                True,
+            )
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Project root
-        # ----------------------------------------------------
+        # ====================================================
 
         self.project_root = Path(
             config.get(
@@ -66,9 +72,9 @@ class OverlapSeparationEngine:
             )
         ).resolve()
 
-        # ----------------------------------------------------
+        # ====================================================
         # Debug
-        # ----------------------------------------------------
+        # ====================================================
 
         self.debug_audio_enabled = bool(
             debug_cfg.get(
@@ -77,13 +83,11 @@ class OverlapSeparationEngine:
             )
         )
 
-        debug_root = debug_cfg.get(
-            "root_dir",
-            "output/debug_audio",
-        )
-
         self.debug_root = self._resolve_project_path(
-            debug_root
+            debug_cfg.get(
+                "root_dir",
+                "output/debug_audio",
+            )
         )
 
         self.save_tse_inputs = bool(
@@ -114,7 +118,7 @@ class OverlapSeparationEngine:
             )
         )
 
-        # Explicit overlap config has priority.
+        # Legacy config remains supported.
         if bool(
             cfg.get(
                 "keep_temp_files",
@@ -123,6 +127,10 @@ class OverlapSeparationEngine:
         ):
             self.keep_tse_temp = True
 
+        # ====================================================
+        # Temporary directory
+        # ====================================================
+
         self.temp_dir = self._resolve_project_path(
             cfg.get(
                 "temp_dir",
@@ -130,9 +138,9 @@ class OverlapSeparationEngine:
             )
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # REAL-T model
-        # ----------------------------------------------------
+        # ====================================================
 
         model_path_value = cfg.get(
             "model_path",
@@ -142,15 +150,13 @@ class OverlapSeparationEngine:
             ),
         )
 
-        self.model_dir = (
-            self._resolve_project_path(
-                model_path_value
-            )
+        self.model_dir = self._resolve_project_path(
+            model_path_value
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # WeSep
-        # ----------------------------------------------------
+        # ====================================================
 
         wesep_path_value = cfg.get(
             "wesep_path",
@@ -160,15 +166,13 @@ class OverlapSeparationEngine:
             ),
         )
 
-        self.wesep_root = (
-            self._resolve_project_path(
-                wesep_path_value
-            )
+        self.wesep_root = self._resolve_project_path(
+            wesep_path_value
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # WeSpeaker
-        # ----------------------------------------------------
+        # ====================================================
 
         wespeaker_path_value = cfg.get(
             "wespeaker_path",
@@ -187,9 +191,9 @@ class OverlapSeparationEngine:
                 / "WeSpeaker"
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Audio
-        # ----------------------------------------------------
+        # ====================================================
 
         self.sample_rate = int(
             cfg.get(
@@ -204,9 +208,9 @@ class OverlapSeparationEngine:
             )
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Context
-        # ----------------------------------------------------
+        # ====================================================
 
         legacy_context = float(
             cfg.get(
@@ -229,9 +233,9 @@ class OverlapSeparationEngine:
             )
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Limits
-        # ----------------------------------------------------
+        # ====================================================
 
         self.min_overlap_seconds = float(
             cfg.get(
@@ -254,9 +258,9 @@ class OverlapSeparationEngine:
             )
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Device
-        # ----------------------------------------------------
+        # ====================================================
 
         self.device = str(
             cfg.get(
@@ -265,9 +269,9 @@ class OverlapSeparationEngine:
             )
         ).lower()
 
-        # ----------------------------------------------------
+        # ====================================================
         # Output normalization
-        # ----------------------------------------------------
+        # ====================================================
 
         self.output_norm = bool(
             cfg.get(
@@ -276,19 +280,22 @@ class OverlapSeparationEngine:
             )
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # Runtime
-        # ----------------------------------------------------
+        # ====================================================
 
         self._model = None
         self._loaded = False
 
         logger.info(
             "OverlapSeparationEngine initialized | "
-            "enabled=%s | sample_rate=%d | device=%s",
+            "enabled=%s | sample_rate=%d | device=%s | "
+            "debug=%s | keep_temp=%s",
             self.enabled,
             self.sample_rate,
             self.device,
+            self.debug_audio_enabled,
+            self.keep_tse_temp,
         )
 
     # ========================================================
@@ -344,22 +351,9 @@ class OverlapSeparationEngine:
     # Local imports
     # ========================================================
 
-    def _setup_local_import_paths(self) -> None:
-        """
-        Handles both:
-
-            models/WeSep/
-                wesep/
-
-        and:
-
-            models/WeSep/wesep/
-                __init__.py
-
-        The previous implementation only inserted the
-        repository path, which could fail when wesep_path
-        itself pointed to the package directory.
-        """
+    def _setup_local_import_paths(
+        self,
+    ) -> None:
 
         if not self.wesep_root:
             raise ValueError(
@@ -381,13 +375,10 @@ class OverlapSeparationEngine:
 
         paths: list[Path] = []
 
-        # Repository root.
         paths.append(
             self.wesep_root
         )
 
-        # If wesep_root itself is the package directory,
-        # Python needs its parent.
         if (
             self.wesep_root.name.lower()
             == "wesep"
@@ -405,7 +396,6 @@ class OverlapSeparationEngine:
                 self.wesep_root
             )
 
-        # WeSpeaker repository.
         paths.append(
             self.wespeaker_root
         )
@@ -431,7 +421,6 @@ class OverlapSeparationEngine:
         for path in paths:
 
             path = path.resolve()
-
             path_string = str(path)
 
             if path_string not in sys.path:
@@ -450,15 +439,13 @@ class OverlapSeparationEngine:
             self.wespeaker_root,
         )
 
-        logger.info(
-            "Local WeSep / WeSpeaker import paths configured."
-        )
-
     # ========================================================
     # Lifecycle
     # ========================================================
 
-    def load(self) -> None:
+    def load(
+        self,
+    ) -> None:
 
         if not self.enabled:
             logger.info(
@@ -497,7 +484,7 @@ class OverlapSeparationEngine:
 
             raise ModuleNotFoundError(
                 "Could not import 'wesep'. "
-                "Checked local WeSep repository: "
+                f"Checked local WeSep repository: "
                 f"{self.wesep_root}"
             ) from exc
 
@@ -703,7 +690,9 @@ class OverlapSeparationEngine:
 
         sf.write(
             str(path),
-            self._normalize_audio(audio),
+            self._normalize_audio(
+                audio
+            ),
             self.sample_rate,
         )
 
@@ -845,12 +834,16 @@ class OverlapSeparationEngine:
 
             return None
 
+        safe_speaker = self._safe_name(
+            target_speaker
+        )
+
         candidates = [
             enrollment_dir
-            / f"{target_speaker}.wav",
+            / f"{safe_speaker}.wav",
 
             enrollment_dir
-            / f"{target_speaker}.WAV",
+            / f"{safe_speaker}.WAV",
         ]
 
         for candidate in candidates:
@@ -885,29 +878,43 @@ class OverlapSeparationEngine:
                 "TSE model is not loaded."
             )
 
-        use_persistent_temp = (
-            self.keep_tse_temp
-            or (
-                self.debug_audio_enabled
-                and self.save_tse_inputs
-            )
-        )
+        persistent = self.keep_tse_temp
 
-        if use_persistent_temp:
+        operation_dir = None
+
+        if persistent:
 
             self.temp_dir.mkdir(
                 parents=True,
                 exist_ok=True,
             )
 
-            operation_dir = (
-                self.temp_dir
-                / (
-                    debug_dir.name
-                    if debug_dir is not None
-                    else "tse"
+            if debug_dir is not None:
+
+                speaker_name = (
+                    debug_dir.parent.name
                 )
-            )
+
+                overlap_name = (
+                    debug_dir.name
+                )
+
+                operation_dir = (
+                    self.temp_dir
+                    / self._safe_name(
+                        speaker_name
+                    )
+                    / self._safe_name(
+                        overlap_name
+                    )
+                )
+
+            else:
+
+                operation_dir = (
+                    self.temp_dir
+                    / "tse"
+                )
 
             operation_dir.mkdir(
                 parents=True,
@@ -965,7 +972,7 @@ class OverlapSeparationEngine:
             return extracted
 
         # ----------------------------------------------------
-        # Normal temporary mode
+        # Temporary mode
         # ----------------------------------------------------
 
         self.temp_dir.mkdir(
@@ -1092,7 +1099,7 @@ class OverlapSeparationEngine:
         )
 
     # ========================================================
-    # Result
+    # Empty result
     # ========================================================
 
     @staticmethod
@@ -1219,16 +1226,6 @@ class OverlapSeparationEngine:
 
                 continue
 
-            logger.info(
-                "TSE [%s] overlap %d: "
-                "%.3f -> %.3f (%.3fs)",
-                target_speaker,
-                index,
-                start,
-                end,
-                duration,
-            )
-
             debug_dir = None
 
             if self.debug_audio_enabled:
@@ -1238,11 +1235,6 @@ class OverlapSeparationEngine:
                         target_speaker,
                         index,
                     )
-                )
-
-                logger.debug(
-                    "TSE debug directory: %s",
-                    debug_dir,
                 )
 
             (
@@ -1317,9 +1309,11 @@ class OverlapSeparationEngine:
                         ]
                     )
 
-                overlap_audio = np.ascontiguousarray(
-                    overlap_audio,
-                    dtype=np.float32,
+                overlap_audio = (
+                    np.ascontiguousarray(
+                        overlap_audio,
+                        dtype=np.float32,
+                    )
                 )
 
                 if (
@@ -1409,7 +1403,9 @@ class OverlapSeparationEngine:
     # Unload
     # ========================================================
 
-    def unload(self) -> None:
+    def unload(
+        self,
+    ) -> None:
 
         logger.info(
             "Unloading overlap separation engine..."

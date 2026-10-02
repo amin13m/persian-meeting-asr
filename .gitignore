@@ -70,3 +70,17 @@ tests/**/results/*.tmp
 
 output/debug_audio
 output/.tse_tmp
+
+
+
+
+
+# ==============================
+# Local input/output data
+# ==============================
+
+/input/*
+!/input/.gitkeep
+
+/output/*
+!/output/.gitkeep
