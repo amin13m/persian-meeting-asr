@@ -66,3 +66,7 @@ models/**/.cache/
 # ============================================================
 
 tests/**/results/*.tmp
+
+
+output/debug_audio
+output/.tse_tmp

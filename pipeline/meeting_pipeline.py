@@ -6,8 +6,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import soundfile as sf
+
 from engines.audio_chunker import AudioChunker
-from engines.diarization.engine import DiarizationEngine
+from engines.diarization.engine import (
+    DiarizationEngine,
+)
 from engines.overlap_separation.engine import (
     OverlapSeparationEngine,
 )
@@ -54,8 +59,108 @@ class MeetingPipeline:
             )
         )
 
+        asr_config = config.get(
+            "asr",
+            {},
+        )
+
+        self.min_turn_seconds = float(
+            asr_config.get(
+                "min_turn_seconds",
+                0.20,
+            )
+        )
+
+        self.max_turn_seconds = float(
+            asr_config.get(
+                "max_turn_seconds",
+                30.0,
+            )
+        )
+
+        self.trim_silence = bool(
+            asr_config.get(
+                "trim_silence",
+                False,
+            )
+        )
+
+        # ----------------------------------------------------
+        # ASR grouping
+        # ----------------------------------------------------
+
+        grouping = asr_config.get(
+            "grouping",
+            {},
+        )
+
+        self.grouping_enabled = bool(
+            grouping.get(
+                "enabled",
+                True,
+            )
+        )
+
+        self.group_max_gap_seconds = float(
+            grouping.get(
+                "max_gap_seconds",
+                1.50,
+            )
+        )
+
+        self.group_max_chunk_seconds = float(
+            grouping.get(
+                "max_chunk_seconds",
+                self.max_turn_seconds,
+            )
+        )
+
+        self.group_min_seconds = float(
+            grouping.get(
+                "min_group_seconds",
+                0.20,
+            )
+        )
+
+        self.group_preserve_gaps = bool(
+            grouping.get(
+                "preserve_gaps",
+                True,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Debug ASR
+        # ----------------------------------------------------
+
+        debug_cfg = (
+            config.get("debug", {})
+            .get("audio", {})
+        )
+
+        self.debug_audio_enabled = bool(
+            debug_cfg.get(
+                "enabled",
+                False,
+            )
+        )
+
+        self.save_asr_debug_audio = bool(
+            debug_cfg.get(
+                "save_asr_chunks",
+                False,
+            )
+        )
+
+        self.debug_root = Path(
+            debug_cfg.get(
+                "root_dir",
+                "output/debug_audio",
+            )
+        )
+
     # ========================================================
-    # Load
+    # Lifecycle
     # ========================================================
 
     def load(self) -> None:
@@ -83,6 +188,7 @@ class MeetingPipeline:
 
         try:
             return float(value)
+
         except (
             TypeError,
             ValueError,
@@ -93,19 +199,6 @@ class MeetingPipeline:
     def _normalize_turn(
         turn: dict,
     ) -> dict | None:
-        """
-        Normalize a diarization turn.
-
-        Expected structure:
-
-        {
-            "speaker": "SPEAKER_00",
-            "start": 1.234,
-            "end": 4.567
-        }
-
-        Returns None for invalid/empty turns.
-        """
 
         speaker = str(
             turn.get(
@@ -114,24 +207,30 @@ class MeetingPipeline:
             )
         ).strip()
 
-        start = MeetingPipeline._safe_float(
-            turn.get(
-                "start",
-                0.0,
+        start = (
+            MeetingPipeline
+            ._safe_float(
+                turn.get(
+                    "start",
+                    0.0,
+                )
             )
         )
 
-        end = MeetingPipeline._safe_float(
-            turn.get(
-                "end",
-                0.0,
+        end = (
+            MeetingPipeline
+            ._safe_float(
+                turn.get(
+                    "end",
+                    0.0,
+                )
             )
         )
 
-        if not speaker:
-            return None
-
-        if end <= start:
+        if (
+            not speaker
+            or end <= start
+        ):
             return None
 
         return {
@@ -145,42 +244,35 @@ class MeetingPipeline:
         self,
         diarization: dict,
     ) -> list[dict]:
-        """
-        Extract chronological speaker turns from
-        the diarization result.
-
-        The diarization engine may expose turns using
-        slightly different container keys. This helper
-        keeps the pipeline tolerant of those structures.
-        """
 
         raw_turns = []
-
-        # ----------------------------------------------------
-        # Normal expected structure
-        # ----------------------------------------------------
 
         if isinstance(
             diarization.get("turns"),
             list,
         ):
-            raw_turns = diarization["turns"]
 
-        # ----------------------------------------------------
-        # Fallback structures
-        # ----------------------------------------------------
+            raw_turns = diarization[
+                "turns"
+            ]
 
         elif isinstance(
             diarization.get("segments"),
             list,
         ):
-            raw_turns = diarization["segments"]
+
+            raw_turns = diarization[
+                "segments"
+            ]
 
         elif isinstance(
             diarization.get("diarization"),
             list,
         ):
-            raw_turns = diarization["diarization"]
+
+            raw_turns = diarization[
+                "diarization"
+            ]
 
         normalized = []
 
@@ -192,18 +284,16 @@ class MeetingPipeline:
             ):
                 continue
 
-            turn = self._normalize_turn(
-                item
+            turn = (
+                self._normalize_turn(
+                    item
+                )
             )
 
             if turn is not None:
                 normalized.append(
                     turn
                 )
-
-        # ----------------------------------------------------
-        # Always chronological
-        # ----------------------------------------------------
 
         normalized.sort(
             key=lambda x: (
@@ -214,70 +304,350 @@ class MeetingPipeline:
 
         return normalized
 
-    def _transcribe_turn(
+    # ========================================================
+    # ASR grouping
+    # ========================================================
+
+    def _build_asr_groups(
         self,
-        audio_path: Path,
+        turns: list[dict],
+    ) -> list[dict]:
+        """
+        Convert many tiny consecutive turns of the same
+        speaker into larger ASR chunks.
+
+        Example:
+
+            SPEAKER_00  1.1 -> 19.0
+            SPEAKER_00 19.9 -> 20.6
+            SPEAKER_00 20.9 -> 21.4
+
+        becomes:
+
+            SPEAKER_00  1.1 -> 21.4
+
+        if the gaps and maximum chunk duration permit it.
+
+        Original turn indices are preserved.
+        """
+
+        if not turns:
+            return []
+
+        if not self.grouping_enabled:
+
+            return [
+                {
+                    "group_index": index,
+                    "speaker": turn["speaker"],
+                    "start": turn["start"],
+                    "end": turn["end"],
+                    "duration": turn["duration"],
+                    "source_turn_indices": [
+                        index
+                    ],
+                    "source_turns": [
+                        dict(turn)
+                    ],
+                }
+                for index, turn
+                in enumerate(turns)
+            ]
+
+        groups = []
+
+        current = None
+
+        for index, turn in enumerate(
+            turns
+        ):
+
+            if current is None:
+
+                current = {
+                    "group_index": len(
+                        groups
+                    ),
+                    "speaker": turn[
+                        "speaker"
+                    ],
+                    "start": turn[
+                        "start"
+                    ],
+                    "end": turn[
+                        "end"
+                    ],
+                    "duration": turn[
+                        "duration"
+                    ],
+                    "source_turn_indices": [
+                        index
+                    ],
+                    "source_turns": [
+                        dict(turn)
+                    ],
+                }
+
+                continue
+
+            same_speaker = (
+                turn["speaker"]
+                == current["speaker"]
+            )
+
+            gap = (
+                turn["start"]
+                - current["end"]
+            )
+
+            candidate_duration = (
+                turn["end"]
+                - current["start"]
+            )
+
+            can_merge = (
+                same_speaker
+                and gap >= 0.0
+                and gap
+                <= self.group_max_gap_seconds
+                and candidate_duration
+                <= self.group_max_chunk_seconds
+            )
+
+            if can_merge:
+
+                current["end"] = turn[
+                    "end"
+                ]
+
+                current["duration"] = (
+                    current["end"]
+                    - current["start"]
+                )
+
+                current[
+                    "source_turn_indices"
+                ].append(index)
+
+                current[
+                    "source_turns"
+                ].append(
+                    dict(turn)
+                )
+
+            else:
+
+                groups.append(
+                    current
+                )
+
+                current = {
+                    "group_index": len(
+                        groups
+                    ),
+                    "speaker": turn[
+                        "speaker"
+                    ],
+                    "start": turn[
+                        "start"
+                    ],
+                    "end": turn[
+                        "end"
+                    ],
+                    "duration": turn[
+                        "duration"
+                    ],
+                    "source_turn_indices": [
+                        index
+                    ],
+                    "source_turns": [
+                        dict(turn)
+                    ],
+                }
+
+        if current is not None:
+            groups.append(
+                current
+            )
+
+        return groups
+
+    # ========================================================
+    # Audio
+    # ========================================================
+
+    @staticmethod
+    def _extract_segment(
+        waveform: np.ndarray,
+        sample_rate: int,
+        start: float,
+        end: float,
+    ) -> np.ndarray:
+
+        if end <= start:
+            return np.zeros(
+                0,
+                dtype=np.float32,
+            )
+
+        start_sample = int(
+            round(
+                start
+                * sample_rate
+            )
+        )
+
+        end_sample = int(
+            round(
+                end
+                * sample_rate
+            )
+        )
+
+        start_sample = max(
+            0,
+            start_sample,
+        )
+
+        end_sample = min(
+            len(waveform),
+            end_sample,
+        )
+
+        if end_sample <= start_sample:
+            return np.zeros(
+                0,
+                dtype=np.float32,
+            )
+
+        return np.ascontiguousarray(
+            waveform[
+                start_sample:end_sample
+            ],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _is_silent(
+        audio: np.ndarray,
+    ) -> bool:
+
+        if audio.size == 0:
+            return True
+
+        return float(
+            np.max(
+                np.abs(audio)
+            )
+        ) < 1e-5
+
+    # ========================================================
+    # Debug ASR audio
+    # ========================================================
+
+    @staticmethod
+    def _safe_name(
+        value: str,
+    ) -> str:
+
+        result = str(value)
+
+        for char in (
+            "\\",
+            "/",
+            ":",
+            "*",
+            "?",
+            '"',
+            "<",
+            ">",
+            "|",
+        ):
+            result = result.replace(
+                char,
+                "_",
+            )
+
+        return result
+
+    def _save_asr_chunk(
+        self,
+        group: dict,
+        audio: np.ndarray,
+        sample_rate: int,
+    ) -> Path | None:
+
+        if not (
+            self.debug_audio_enabled
+            and self.save_asr_debug_audio
+        ):
+            return None
+
+        speaker = self._safe_name(
+            group["speaker"]
+        )
+
+        path = (
+            self.debug_root
+            / "asr_chunks"
+            / speaker
+            / (
+                f"group_"
+                f"{group['group_index']:03d}.wav"
+            )
+        )
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        sf.write(
+            str(path),
+            audio,
+            sample_rate,
+        )
+
+        logger.debug(
+            "Saved ASR debug chunk: %s",
+            path,
+        )
+
+        return path
+
+    # ========================================================
+    # ASR
+    # ========================================================
+
+    def _transcribe_audio(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
         start: float,
         end: float,
     ) -> str:
-        """
-        Extract one original-time audio segment and
-        send only that segment to Whisper.
-
-        IMPORTANT:
-        The returned text belongs to [start, end]
-        in the ORIGINAL meeting timeline.
-        """
 
         duration = end - start
 
         if duration <= 0:
             return ""
 
-        logger.debug(
-            "Extracting ASR segment: %.3f -> %.3f",
-            start,
-            end,
-        )
+        if (
+            duration
+            < self.group_min_seconds
+        ):
 
-        # ----------------------------------------------------
-        # AudioChunker works on the original file and
-        # returns an audio chunk with its own audio data.
-        #
-        # We use a dedicated chunk window here so the
-        # Whisper timestamps do not replace the original
-        # meeting timestamps.
-        # ----------------------------------------------------
+            return ""
 
-        chunks = self.chunker.chunk_file(
-            audio_path
-        )
+        if audio.size == 0:
+            return ""
 
-        target_chunk = None
+        if self._is_silent(
+            audio
+        ):
 
-        for chunk in chunks:
-
-            chunk_start = float(
-                chunk.start
-            )
-
-            chunk_end = float(
-                chunk.end
-            )
-
-            # Find a chunk containing the requested
-            # diarization interval.
-            if (
-                chunk_start <= start
-                and chunk_end >= end
-            ):
-                target_chunk = chunk
-                break
-
-        if target_chunk is None:
-
-            logger.warning(
-                "Could not find audio chunk for "
+            logger.debug(
+                "Skipping silent ASR group: "
                 "%.3f -> %.3f",
                 start,
                 end,
@@ -285,92 +655,39 @@ class MeetingPipeline:
 
             return ""
 
-        # ----------------------------------------------------
-        # If the chunk is larger than the diarization turn,
-        # extract the exact sub-window from the chunk.
-        #
-        # This keeps Whisper focused on the actual speaker
-        # turn instead of transcribing neighbouring speech.
-        # ----------------------------------------------------
-
-        relative_start = max(
-            0.0,
-            start
-            - float(
-                target_chunk.start
-            ),
-        )
-
-        relative_end = min(
-            float(
-                target_chunk.duration
-            ),
-            end
-            - float(
-                target_chunk.start
-            ),
-        )
-
-        if relative_end <= relative_start:
-            return ""
-
-        audio = target_chunk.audio
-
         try:
-            import numpy as np
-
-            sample_rate = int(
-                self.chunker.sample_rate
-            )
-
-            sample_start = int(
-                round(
-                    relative_start
-                    * sample_rate
-                )
-            )
-
-            sample_end = int(
-                round(
-                    relative_end
-                    * sample_rate
-                )
-            )
-
-            if sample_start < 0:
-                sample_start = 0
-
-            if sample_end > len(audio):
-                sample_end = len(audio)
-
-            if sample_end <= sample_start:
-                return ""
-
-            segment_audio = audio[
-                sample_start:sample_end
-            ]
-
-            # Make sure Whisper receives a numpy
-            # array in the expected form.
-            if not isinstance(
-                segment_audio,
-                np.ndarray,
-            ):
-                segment_audio = np.asarray(
-                    segment_audio
-                )
 
             result = (
                 self.asr_engine.transcribe(
-                    segment_audio,
-                    sample_rate=sample_rate,
+                    audio,
+                    sample_rate=int(
+                        sample_rate
+                    ),
                 )
             )
+
+            if isinstance(
+                result,
+                dict,
+            ):
+
+                text = result.get(
+                    "text",
+                    "",
+                )
+
+            else:
+
+                text = result
+
+            return str(
+                text or ""
+            ).strip()
 
         except Exception:
 
             logger.exception(
-                "ASR failed for segment "
+                "ASR failed for "
                 "%.3f -> %.3f",
                 start,
                 end,
@@ -378,20 +695,54 @@ class MeetingPipeline:
 
             return ""
 
-        if isinstance(
-            result,
-            dict,
-        ):
-            text = result.get(
-                "text",
-                "",
-            )
-        else:
-            text = result
+    def _transcribe_group(
+        self,
+        group: dict,
+        speaker_waveform: np.ndarray,
+        sample_rate: int,
+    ) -> tuple[str, Path | None]:
 
-        return str(
-            text or ""
-        ).strip()
+        start = float(
+            group["start"]
+        )
+
+        end = float(
+            group["end"]
+        )
+
+        # ----------------------------------------------------
+        # Timeline-preserving extraction.
+        #
+        # Because speaker_waveform contains only this speaker,
+        # any speech belonging to other speakers is zero.
+        # ----------------------------------------------------
+
+        audio = self._extract_segment(
+            speaker_waveform,
+            sample_rate,
+            start,
+            end,
+        )
+
+        if audio.size == 0:
+            return "", None
+
+        debug_path = (
+            self._save_asr_chunk(
+                group,
+                audio,
+                sample_rate,
+            )
+        )
+
+        text = self._transcribe_audio(
+            audio,
+            sample_rate,
+            start,
+            end,
+        )
+
+        return text, debug_path
 
     # ========================================================
     # Process
@@ -416,7 +767,9 @@ class MeetingPipeline:
             exist_ok=True,
         )
 
-        file_start = time.perf_counter()
+        file_start = (
+            time.perf_counter()
+        )
 
         logger.info("")
         logger.info(
@@ -456,11 +809,12 @@ class MeetingPipeline:
         )
 
         # ====================================================
-        # 2. Speaker isolation
+        # 2. Speaker isolation + TSE
         # ====================================================
 
         logger.info(
-            "[2/4] Speaker isolation"
+            "[2/4] Speaker isolation + "
+            "overlap separation"
         )
 
         isolation_dir = (
@@ -476,128 +830,198 @@ class MeetingPipeline:
             )
         )
 
+        speaker_audio = (
+            self.isolation
+            .get_all_speaker_audio()
+        )
+
+        isolation_sample_rate = int(
+            isolation.get(
+                "audio",
+                {},
+            ).get(
+                "sample_rate",
+                16000,
+            )
+        )
+
+        logger.info(
+            "Speaker timelines available: %d",
+            len(speaker_audio),
+        )
+
         # ====================================================
-        # 3. ASR
+        # 3. Build ASR groups
         # ====================================================
 
         logger.info(
-            "[3/4] Turn-level ASR"
+            "[3/4] Building ASR groups"
         )
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Do NOT transcribe:
-        #
-        #   SPEAKER_00.wav
-        #   SPEAKER_01.wav
-        #
-        # as one large file.
-        #
-        # That destroys the original conversation timeline.
-        #
-        # Instead:
-        #
-        #   diarization turn
-        #          ↓
-        #   original audio [start -> end]
-        #          ↓
-        #   Whisper
-        #          ↓
-        #   preserve original start/end
-        # ----------------------------------------------------
+        asr_groups = (
+            self._build_asr_groups(
+                turns
+            )
+        )
+
+        logger.info(
+            "Diarization turns: %d -> "
+            "ASR groups: %d",
+            len(turns),
+            len(asr_groups),
+        )
 
         conversation_turns = []
 
-        for index, turn in enumerate(
-            turns
-        ):
+        # ----------------------------------------------------
+        # ASR groups
+        # ----------------------------------------------------
 
-            speaker = turn[
+        for group in asr_groups:
+
+            speaker = group[
                 "speaker"
             ]
 
             start = float(
-                turn["start"]
+                group["start"]
             )
 
             end = float(
-                turn["end"]
+                group["end"]
             )
 
             duration = float(
-                turn["duration"]
+                group["duration"]
+            )
+
+            source_indices = list(
+                group[
+                    "source_turn_indices"
+                ]
             )
 
             logger.info(
-                "Transcribing turn %d: "
-                "%s [%.3f -> %.3f]",
-                index,
+                "ASR group %d: %s "
+                "[%.3f -> %.3f] "
+                "(%.3fs) | source turns=%s",
+                group["group_index"],
                 speaker,
                 start,
                 end,
+                duration,
+                source_indices,
             )
 
-            text = (
-                self._transcribe_turn(
-                    audio_path,
-                    start,
-                    end,
+            speaker_waveform = (
+                speaker_audio.get(
+                    speaker
                 )
             )
 
-            item = {
-                "turn_index": index,
+            debug_path = None
 
-                "speaker": speaker,
+            if speaker_waveform is None:
 
-                "start": round(
-                    start,
-                    3,
-                ),
+                logger.warning(
+                    "No isolated timeline "
+                    "for speaker %s",
+                    speaker,
+                )
 
-                "end": round(
-                    end,
-                    3,
-                ),
+                text = ""
 
-                "duration": round(
-                    duration,
-                    3,
-                ),
+            else:
 
-                "text": text,
-            }
-
-            # ------------------------------------------------
-            # Keep the turn even if Whisper returns no text.
-            #
-            # This preserves the diarization timeline.
-            # ------------------------------------------------
+                text, debug_path = (
+                    self._transcribe_group(
+                        group,
+                        speaker_waveform,
+                        isolation_sample_rate,
+                    )
+                )
 
             conversation_turns.append(
-                item
-            )
+                {
+                    "group_index": group[
+                        "group_index"
+                    ],
 
-        # ----------------------------------------------------
-        # Final chronological ordering
-        # ----------------------------------------------------
+                    "speaker": speaker,
 
-        conversation_turns.sort(
-            key=lambda x: (
-                x["start"],
-                x["end"],
-                x["turn_index"],
+                    "start": round(
+                        start,
+                        3,
+                    ),
+
+                    "end": round(
+                        end,
+                        3,
+                    ),
+
+                    "duration": round(
+                        duration,
+                        3,
+                    ),
+
+                    "text": text,
+
+                    "source_turn_indices": (
+                        source_indices
+                    ),
+
+                    "source_turns": [
+                        {
+                            "speaker": item[
+                                "speaker"
+                            ],
+                            "start": round(
+                                float(
+                                    item[
+                                        "start"
+                                    ]
+                                ),
+                                3,
+                            ),
+                            "end": round(
+                                float(
+                                    item[
+                                        "end"
+                                    ]
+                                ),
+                                3,
+                            ),
+                            "duration": round(
+                                float(
+                                    item[
+                                        "duration"
+                                    ]
+                                ),
+                                3,
+                            ),
+                        }
+                        for item in group[
+                            "source_turns"
+                        ]
+                    ],
+
+                    "debug_audio": (
+                        str(debug_path)
+                        if debug_path
+                        else None
+                    ),
+                }
             )
-        )
 
         # ====================================================
-        # Build speaker-oriented transcription
+        # Speaker transcriptions
         # ====================================================
 
         speaker_transcriptions = {}
 
-        for item in conversation_turns:
+        for item in (
+            conversation_turns
+        ):
 
             speaker = item[
                 "speaker"
@@ -606,6 +1030,7 @@ class MeetingPipeline:
             if speaker not in (
                 speaker_transcriptions
             ):
+
                 speaker_transcriptions[
                     speaker
                 ] = []
@@ -614,8 +1039,8 @@ class MeetingPipeline:
                 speaker
             ].append(
                 {
-                    "turn_index": item[
-                        "turn_index"
+                    "group_index": item[
+                        "group_index"
                     ],
 
                     "start": item[
@@ -633,11 +1058,17 @@ class MeetingPipeline:
                     "text": item[
                         "text"
                     ],
+
+                    "source_turn_indices": (
+                        item[
+                            "source_turn_indices"
+                        ]
+                    ),
                 }
             )
 
         # ====================================================
-        # 4. Build meeting result
+        # 4. Final JSON
         # ====================================================
 
         logger.info(
@@ -650,6 +1081,7 @@ class MeetingPipeline:
         )
 
         result = {
+
             "project": {
                 "name": self.config.get(
                     "project",
@@ -673,35 +1105,87 @@ class MeetingPipeline:
 
             "transcription": {
 
-                # --------------------------------------------
-                # Primary representation:
-                # actual chronological conversation
-                # --------------------------------------------
+                # New grouped ASR output.
+                "turns": conversation_turns,
 
-                "turns": (
-                    conversation_turns
-                ),
-
-                # --------------------------------------------
-                # Secondary representation:
-                # grouped by speaker, but with ORIGINAL
-                # timestamps preserved.
-                # --------------------------------------------
+                # Original diarization turns.
+                "raw_turns": [
+                    {
+                        "turn_index": index,
+                        "speaker": turn[
+                            "speaker"
+                        ],
+                        "start": round(
+                            float(
+                                turn["start"]
+                            ),
+                            3,
+                        ),
+                        "end": round(
+                            float(
+                                turn["end"]
+                            ),
+                            3,
+                        ),
+                        "duration": round(
+                            float(
+                                turn["duration"]
+                            ),
+                            3,
+                        ),
+                    }
+                    for index, turn
+                    in enumerate(turns)
+                ],
 
                 "speakers": (
                     speaker_transcriptions
                 ),
 
+                "grouping": {
+                    "enabled": (
+                        self.grouping_enabled
+                    ),
+                    "max_gap_seconds": (
+                        self.group_max_gap_seconds
+                    ),
+                    "max_chunk_seconds": (
+                        self.group_max_chunk_seconds
+                    ),
+                    "group_count": len(
+                        asr_groups
+                    ),
+                    "raw_turn_count": len(
+                        turns
+                    ),
+                },
             },
 
             "processing": {
+
                 "total_seconds": round(
                     total_time,
                     3,
                 ),
 
                 "transcription_mode": (
-                    "turn_level"
+                    "speaker_isolated_grouped_asr"
+                ),
+
+                "overlap_strategy": (
+                    "REAL-T_target_speaker_extraction"
+                ),
+
+                "asr_source": (
+                    "isolated_speaker_timeline"
+                ),
+
+                "tse_source": (
+                    "overlap_regions_only"
+                ),
+
+                "asr_grouping": (
+                    self.grouping_enabled
                 ),
             },
         }
@@ -728,18 +1212,11 @@ class MeetingPipeline:
         # TXT
         # ====================================================
 
-        # IMPORTANT:
-        #
-        # Iterate over conversation_turns,
-        # NOT speaker_transcriptions.
-        #
-        # Therefore the TXT follows the real
-        # chronological conversation.
-        # ====================================================
-
         txt_lines = []
 
-        for item in conversation_turns:
+        for item in (
+            conversation_turns
+        ):
 
             text = str(
                 item.get(
@@ -748,8 +1225,6 @@ class MeetingPipeline:
                 )
             ).strip()
 
-            # Do not write empty Whisper results
-            # into the human-readable transcript.
             if not text:
                 continue
 
@@ -779,10 +1254,6 @@ class MeetingPipeline:
             encoding="utf-8",
         )
 
-        # ====================================================
-        # Logs
-        # ====================================================
-
         logger.info(
             "Meeting JSON: %s",
             json_path,
@@ -794,10 +1265,13 @@ class MeetingPipeline:
         )
 
         logger.info(
-            "Conversation turns: %d",
-            len(
-                conversation_turns
-            ),
+            "Raw diarization turns: %d",
+            len(turns),
+        )
+
+        logger.info(
+            "ASR groups: %d",
+            len(conversation_turns),
         )
 
         logger.info(
@@ -816,6 +1290,8 @@ class MeetingPipeline:
         logger.info(
             "Unloading meeting pipeline..."
         )
+
+        self.isolation.clear_audio_buffers()
 
         self.diarization.unload()
         self.overlap.unload()

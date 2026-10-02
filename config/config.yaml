@@ -1,52 +1,33 @@
-# ============================================================
-# Persian ASR - Main Configuration
-# ============================================================
-
 project:
   name: persian_asr
   mode: offline
 
-# ============================================================
-# Main ASR Engine
-# ============================================================
 
 engine:
   name: whisper_persian_v4
 
+
 model:
   path: models/whisper_persian_v4
 
-# ============================================================
-# Diarization
-# ============================================================
 
 diarization:
   enabled: true
-
   engine: pyannote
-
-  # Local offline model
   model_path: models/diarization/speaker-diarization-community-1
 
   sample_rate: 16000
-
   device: cuda
 
-  # اگر null باشند، مدل خودش تعداد گوینده‌ها را تخمین می‌زند.
   min_speakers: 3
   max_speakers: 5
 
-  # خروجی‌ها
   save_rttm: true
   save_json: true
   save_turns: true
 
-  # برای merge بهتر با ASR
   use_exclusive: true
 
-# ============================================================
-# Audio
-# ============================================================
 
 audio:
   input_dir: input
@@ -65,36 +46,24 @@ audio:
     - .m4a
     - .ogg
 
-# ============================================================
-# Audio Preprocessing
-# ============================================================
 
 preprocessing:
   enabled: true
 
-  # تبدیل همه ورودی‌ها به 16 kHz
   resample:
     enabled: true
     sample_rate: 16000
 
-  # تبدیل به mono
   mono:
     enabled: true
 
-  # فعلاً خاموش.
-  # بعد از تست ASR و diarization، enhancement را جداگانه اضافه می‌کنیم.
   enhancement:
     enabled: false
-
     engine: null
-
     denoise: false
     dereverb: false
     normalization: false
 
-# ============================================================
-# Whisper Chunking
-# ============================================================
 
 chunking:
   enabled: true
@@ -102,44 +71,174 @@ chunking:
   max_chunk_seconds: 30
   min_chunk_seconds: 0.5
 
-  # تشخیص سکوت
   silence_top_db: 30
   min_silence_seconds: 0.35
 
-  # کمی context اطراف هر chunk
   padding_before_seconds: 0.20
   padding_after_seconds: 0.20
 
-  # اگر split بر اساس silence جواب نداد
   fallback_split_seconds: 30
 
+
 # ============================================================
-# Output
+# DEBUG AUDIO
 # ============================================================
 
+debug:
+
+  audio:
+
+    # Master switch
+    enabled: true
+
+    # Relative to project root.
+    root_dir: output/debug_audio
+
+    # Speaker clean reference/enrollment audio.
+    save_speaker_references: true
+
+    # REAL-T / WeSep local mixture passed to TSE.
+    save_tse_inputs: true
+
+    # REAL-T / WeSep extracted result.
+    save_tse_outputs: true
+
+    # Final exact-overlap audio returned by TSE.
+    save_tse_overlap: true
+
+    # Audio chunks actually sent to Whisper.
+    save_asr_chunks: true
+
+    # Keep internal TSE temporary directory.
+    #
+    # If true, temporary files are not deleted.
+    keep_tse_temp: true
+
+
+# ============================================================
+# REAL-T / WeSep overlap separation
+# ============================================================
+
+overlap_separation:
+
+  enabled: true
+
+  engine: real_t
+
+  model_path: models/REAL-T/spk_emb_100
+
+  wesep_path: models/WeSep
+  wespeaker_path: models/WeSpeaker
+
+  sample_rate: 16000
+
+  device: cuda
+
+  dtype: float16
+
+  min_overlap_seconds: 0.20
+
+  context_before_seconds: 0.50
+  context_after_seconds: 0.50
+
+  max_region_seconds: 8.0
+
+  # Legacy option.
+  merge_gap_seconds: 0.10
+
+  # Used only when debug.audio is disabled.
+  temp_dir: output/.tse_tmp
+
+  # Can independently keep the TSE temporary files.
+  keep_temp_files: false
+
+
+# ============================================================
+# Speaker isolation
+# ============================================================
+
+speaker_isolation:
+
+  enabled: true
+
+  preserve_timeline: true
+
+  # Existing manually prepared references can still be used.
+  references_dir: output/references
+
+  # Automatically create a reference from clean speech.
+  auto_create_references: true
+
+  # Rebuild the reference every run.
+  #
+  # Set false if you want manually prepared references
+  # to remain untouched.
+  overwrite_references: true
+
+  # Maximum duration of each speaker reference.
+  reference_max_seconds: 8.0
+
+  # Minimum clean speech required to create a reference.
+  reference_min_seconds: 1.0
+
+  save_timeline: true
+
+  output_dir: speakers
+
+
+# ============================================================
+# ASR
+# ============================================================
+
+asr:
+
+  min_turn_seconds: 0.20
+
+  max_turn_seconds: 30.0
+
+  trim_silence: false
+
+  # ----------------------------------------------------------
+  # Group short/consecutive turns before Whisper.
+  # ----------------------------------------------------------
+
+  grouping:
+
+    enabled: true
+
+    # Same speaker turns separated by <= this amount
+    # are considered consecutive.
+    max_gap_seconds: 1.50
+
+    # Maximum timeline duration of one Whisper request.
+    max_chunk_seconds: 30.0
+
+    # Do not create groups shorter than this value
+    # unless they are the only available turn.
+    min_group_seconds: 0.20
+
+    # Keep original silent gaps between grouped turns.
+    #
+    # Because speaker timelines are timeline-preserving,
+    # speech from other speakers is already zeroed.
+    preserve_gaps: true
+
+
 output:
+
   save_txt: true
   save_json: true
 
   save_chunks: true
-
-  # خروجی speaker turns
   save_speaker_turns: true
 
-  # استاندارد diarization
   save_rttm: true
 
-# ============================================================
-# Compute
-# ============================================================
 
 device:
   type: cuda
   dtype: float16
 
-# ============================================================
-# Logging
-# ============================================================
 
 logging:
   level: INFO
