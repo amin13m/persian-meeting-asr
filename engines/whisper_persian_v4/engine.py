@@ -429,6 +429,7 @@ class WhisperPersianV4Engine:
         generation_kwargs = {
             "language": self.language,
             "task": self.task,
+            "condition_on_prev_tokens": False
         }
 
         if attention_mask is not None:

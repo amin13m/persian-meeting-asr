@@ -10,6 +10,10 @@ from engines.whisper_persian_v4.engine import (
     WhisperPersianV4Engine,
 )
 
+from engines.shenava_koochik.engine import (
+    ShenavaKoochikEngine,
+)
+
 from pipeline.meeting_pipeline import (
     MeetingPipeline,
 )
@@ -149,6 +153,81 @@ def find_audio_files(
 
 
 # ============================================================
+# Resolve model paths
+# ============================================================
+
+def resolve_path(
+    project_root: Path,
+    configured_path: str,
+) -> Path:
+
+    path = Path(
+        configured_path
+    )
+
+    if path.is_absolute():
+        return path
+
+    return (
+        project_root
+        / path
+    )
+
+
+# ============================================================
+# Validate Whisper model
+# ============================================================
+
+def validate_whisper_model(
+    model_path: Path,
+) -> None:
+
+    if not model_path.exists():
+
+        raise FileNotFoundError(
+            "Whisper model directory not found: "
+            f"{model_path}"
+        )
+
+    if not model_path.is_dir():
+
+        raise ValueError(
+            "Whisper model path is not a directory: "
+            f"{model_path}"
+        )
+
+
+# ============================================================
+# Validate Shenava model
+# ============================================================
+
+def validate_shenava_model(
+    model_path: Path,
+) -> None:
+
+    if not model_path.exists():
+
+        raise FileNotFoundError(
+            "Shenava model checkpoint not found: "
+            f"{model_path}"
+        )
+
+    if not model_path.is_file():
+
+        raise ValueError(
+            "Shenava model path is not a file: "
+            f"{model_path}"
+        )
+
+    if model_path.suffix.lower() != ".nemo":
+
+        raise ValueError(
+            "Shenava model must be a .nemo checkpoint: "
+            f"{model_path}"
+        )
+
+
+# ============================================================
 # Main
 # ============================================================
 
@@ -156,7 +235,8 @@ def main() -> int:
 
     process_start = time.perf_counter()
 
-    asr_engine = None
+    whisper_engine = None
+    shenava_engine = None
     meeting_pipeline = None
 
     successful = 0
@@ -194,6 +274,101 @@ def main() -> int:
         )
 
         # ====================================================
+        # Read ASR configuration
+        # ====================================================
+
+        asr_config = config.get(
+            "asr",
+            {},
+        )
+
+        if not isinstance(
+            asr_config,
+            dict,
+        ):
+            raise ValueError(
+                "config.asr must be a dictionary."
+            )
+
+        primary_config = asr_config.get(
+            "primary",
+            {},
+        )
+
+        secondary_config = asr_config.get(
+            "secondary",
+            {},
+        )
+
+        if not isinstance(
+            primary_config,
+            dict,
+        ):
+            raise ValueError(
+                "config.asr.primary must be a dictionary."
+            )
+
+        if not isinstance(
+            secondary_config,
+            dict,
+        ):
+            raise ValueError(
+                "config.asr.secondary must be a dictionary."
+            )
+
+        # ====================================================
+        # Primary / Secondary enabled
+        # ====================================================
+
+        primary_enabled = bool(
+            primary_config.get(
+                "enabled",
+                True,
+            )
+        )
+
+        secondary_enabled = bool(
+            secondary_config.get(
+                "enabled",
+                False,
+            )
+        )
+
+        if not primary_enabled:
+            raise ValueError(
+                "Primary ASR is disabled. "
+                "This pipeline currently requires a primary ASR."
+            )
+
+        primary_engine_name = (
+            primary_config.get(
+                "engine",
+                "whisper_persian_v4",
+            )
+        )
+
+        secondary_engine_name = (
+            secondary_config.get(
+                "engine",
+                "shenava_koochik",
+            )
+        )
+
+        logger.info(
+            "Primary ASR engine  : %s",
+            primary_engine_name,
+        )
+
+        logger.info(
+            "Secondary ASR       : %s",
+            (
+                secondary_engine_name
+                if secondary_enabled
+                else "disabled"
+            ),
+        )
+
+        # ====================================================
         # Paths
         # ====================================================
 
@@ -202,35 +377,119 @@ def main() -> int:
             {},
         )
 
-        input_dir = (
-            PROJECT_ROOT
-            / audio_config.get(
+        input_dir = resolve_path(
+            PROJECT_ROOT,
+            audio_config.get(
                 "input_dir",
                 "input",
-            )
+            ),
         )
 
-        output_dir = (
-            PROJECT_ROOT
-            / audio_config.get(
+        output_dir = resolve_path(
+            PROJECT_ROOT,
+            audio_config.get(
                 "output_dir",
                 "output",
-            )
+            ),
         )
 
-        whisper_model_path = (
-            PROJECT_ROOT
-            / config
-            .get("model", {})
+        # ====================================================
+        # Whisper model path
+        #
+        # Preferred:
+        #   asr.primary.model.path
+        #
+        # Legacy fallback:
+        #   model.path
+        # ====================================================
+
+        whisper_model_config = (
+            primary_config
             .get(
-                "path",
-                "",
+                "model",
+                {},
             )
         )
 
-        # ----------------------------------------------------
+        if isinstance(
+            whisper_model_config,
+            dict,
+        ):
+
+            whisper_model_path_str = (
+                whisper_model_config.get(
+                    "path",
+                    "",
+                )
+            )
+
+        else:
+
+            whisper_model_path_str = (
+                str(
+                    whisper_model_config
+                )
+            )
+
+        if not whisper_model_path_str:
+
+            whisper_model_path_str = (
+                config
+                .get(
+                    "model",
+                    {},
+                )
+                .get(
+                    "path",
+                    "",
+                )
+            )
+
+        whisper_model_path = resolve_path(
+            PROJECT_ROOT,
+            whisper_model_path_str,
+        )
+
+        # ====================================================
+        # Shenava model path
+        # ====================================================
+
+        shenava_model_config = (
+            secondary_config
+            .get(
+                "model",
+                {},
+            )
+        )
+
+        if isinstance(
+            shenava_model_config,
+            dict,
+        ):
+
+            shenava_model_path_str = (
+                shenava_model_config.get(
+                    "path",
+                    "",
+                )
+            )
+
+        else:
+
+            shenava_model_path_str = (
+                str(
+                    shenava_model_config
+                )
+            )
+
+        shenava_model_path = resolve_path(
+            PROJECT_ROOT,
+            shenava_model_path_str,
+        )
+
+        # ====================================================
         # Create directories
-        # ----------------------------------------------------
+        # ====================================================
 
         input_dir.mkdir(
             parents=True,
@@ -257,20 +516,25 @@ def main() -> int:
             whisper_model_path,
         )
 
-        # ====================================================
-        # Validate Whisper model
-        # ====================================================
+        if secondary_enabled:
 
-        if not whisper_model_path.exists():
-            raise FileNotFoundError(
-                "Whisper model directory not found: "
-                f"{whisper_model_path}"
+            logger.info(
+                "Shenava model   : %s",
+                shenava_model_path,
             )
 
-        if not whisper_model_path.is_dir():
-            raise ValueError(
-                "Whisper model path is not a directory: "
-                f"{whisper_model_path}"
+        # ====================================================
+        # Validate models
+        # ====================================================
+
+        validate_whisper_model(
+            whisper_model_path
+        )
+
+        if secondary_enabled:
+
+            validate_shenava_model(
+                shenava_model_path
             )
 
         # ====================================================
@@ -292,6 +556,7 @@ def main() -> int:
             extensions,
             list,
         ):
+
             raise ValueError(
                 "audio.extensions must be a list."
             )
@@ -336,30 +601,31 @@ def main() -> int:
             )
 
         # ====================================================
-        # Create Whisper ASR engine
+        # Create Primary ASR
         # ====================================================
 
         logger.info(
-            "Creating Whisper engine..."
+            "Creating primary ASR engine: %s",
+            primary_engine_name,
         )
 
-        asr_engine = (
+        whisper_engine = (
             WhisperPersianV4Engine(
                 config
             )
         )
 
         # ====================================================
-        # Load Whisper
+        # Load Primary ASR
         # ====================================================
 
         logger.info(
-            "Loading Whisper engine..."
+            "Loading primary ASR engine..."
         )
 
         asr_start = time.perf_counter()
 
-        asr_engine.load()
+        whisper_engine.load()
 
         asr_load_time = (
             time.perf_counter()
@@ -367,9 +633,56 @@ def main() -> int:
         )
 
         logger.info(
-            "Whisper loaded in %.3f sec.",
+            "Primary ASR loaded in %.3f sec.",
             asr_load_time,
         )
+
+        # ====================================================
+        # Create Secondary ASR
+        # ====================================================
+
+        if secondary_enabled:
+
+            logger.info(
+                "Creating secondary ASR engine: %s",
+                secondary_engine_name,
+            )
+
+            shenava_engine = (
+                ShenavaKoochikEngine(
+                    config
+                )
+            )
+
+            # ------------------------------------------------
+            # Load Shenava
+            # ------------------------------------------------
+
+            logger.info(
+                "Loading secondary ASR engine..."
+            )
+
+            shenava_start = (
+                time.perf_counter()
+            )
+
+            shenava_engine.load()
+
+            shenava_load_time = (
+                time.perf_counter()
+                - shenava_start
+            )
+
+            logger.info(
+                "Secondary ASR loaded in %.3f sec.",
+                shenava_load_time,
+            )
+
+        else:
+
+            logger.info(
+                "Secondary ASR is disabled."
+            )
 
         # ====================================================
         # Create Meeting Pipeline
@@ -381,8 +694,9 @@ def main() -> int:
 
         meeting_pipeline = (
             MeetingPipeline(
-                config,
-                asr_engine,
+                config=config,
+                asr_engine=whisper_engine,
+                secondary_asr_engine=shenava_engine,
             )
         )
 
@@ -411,6 +725,33 @@ def main() -> int:
         )
 
         # ====================================================
+        # ASR architecture summary
+        # ====================================================
+
+        logger.info("")
+        logger.info(
+            "ASR configuration:"
+        )
+
+        logger.info(
+            "  Primary   : %s",
+            primary_engine_name,
+        )
+
+        logger.info(
+            "  Secondary : %s",
+            (
+                secondary_engine_name
+                if secondary_enabled
+                else "disabled"
+            ),
+        )
+
+        logger.info(
+            "  Same group audio -> both engines"
+        )
+
+        # ====================================================
         # Process files
         # ====================================================
 
@@ -420,6 +761,7 @@ def main() -> int:
         ):
 
             logger.info("")
+
             logger.info(
                 "=" * 70
             )
@@ -500,10 +842,6 @@ def main() -> int:
                     "Time       : %.3f sec",
                     file_time,
                 )
-
-                # ------------------------------------------------
-                # Optional result logging
-                # ------------------------------------------------
 
                 if result is not None:
 
@@ -623,6 +961,9 @@ def main() -> int:
 
         # ----------------------------------------------------
         # Meeting pipeline
+        #
+        # Pipeline owns diarization / TSE / grouping.
+        # It should NOT unload ASR engines if main owns them.
         # ----------------------------------------------------
 
         if meeting_pipeline is not None:
@@ -646,10 +987,34 @@ def main() -> int:
                 )
 
         # ----------------------------------------------------
-        # Whisper
+        # Secondary ASR
         # ----------------------------------------------------
 
-        if asr_engine is not None:
+        if shenava_engine is not None:
+
+            logger.info(
+                "Unloading Shenava engine..."
+            )
+
+            try:
+
+                shenava_engine.unload()
+
+                logger.info(
+                    "Shenava engine unloaded."
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Shenava unload failed."
+                )
+
+        # ----------------------------------------------------
+        # Primary ASR
+        # ----------------------------------------------------
+
+        if whisper_engine is not None:
 
             logger.info(
                 "Unloading Whisper engine..."
@@ -657,7 +1022,7 @@ def main() -> int:
 
             try:
 
-                asr_engine.unload()
+                whisper_engine.unload()
 
                 logger.info(
                     "Whisper engine unloaded."

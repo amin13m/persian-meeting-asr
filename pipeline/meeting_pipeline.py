@@ -34,9 +34,30 @@ class MeetingPipeline:
         self,
         config: dict,
         asr_engine,
+        secondary_asr_engine=None,
     ):
         self.config = config
+
+        # ====================================================
+        # ASR ENGINES
+        # ====================================================
+
+        # Primary ASR
+        # Current:
+        #     Whisper Persian V4
+        #
         self.asr_engine = asr_engine
+
+        # Secondary ASR
+        # Current:
+        #     Shenava Koochik
+        #
+        # Optional so that the pipeline can still operate
+        # with Whisper only.
+        #
+        self.secondary_asr_engine = (
+            secondary_asr_engine
+        )
 
         # ====================================================
         # Engines
@@ -178,8 +199,44 @@ class MeetingPipeline:
             "Loading meeting pipeline..."
         )
 
+        # ----------------------------------------------------
+        # Diarization
+        # ----------------------------------------------------
+
         self.diarization.load()
+
+        # ----------------------------------------------------
+        # Overlap / TSE
+        # ----------------------------------------------------
+
         self.overlap.load()
+
+        # ----------------------------------------------------
+        # Primary ASR
+        # ----------------------------------------------------
+
+        if self.asr_engine is not None:
+
+            logger.info(
+                "Loading primary ASR engine..."
+            )
+
+            self.asr_engine.load()
+
+        # ----------------------------------------------------
+        # Secondary ASR
+        # ----------------------------------------------------
+
+        if (
+            self.secondary_asr_engine
+            is not None
+        ):
+
+            logger.info(
+                "Loading secondary ASR engine..."
+            )
+
+            self.secondary_asr_engine.load()
 
         logger.info(
             "Meeting pipeline loaded."
@@ -196,11 +253,16 @@ class MeetingPipeline:
     ) -> float:
 
         try:
-            return float(value)
+
+            return float(
+                value
+            )
+
         except (
             TypeError,
             ValueError,
         ):
+
             return default
 
     @staticmethod
@@ -233,6 +295,7 @@ class MeetingPipeline:
             not speaker
             or end <= start
         ):
+
             return None
 
         return {
@@ -250,7 +313,9 @@ class MeetingPipeline:
         raw_turns = []
 
         if isinstance(
-            diarization.get("turns"),
+            diarization.get(
+                "turns"
+            ),
             list,
         ):
 
@@ -261,7 +326,9 @@ class MeetingPipeline:
             )
 
         elif isinstance(
-            diarization.get("segments"),
+            diarization.get(
+                "segments"
+            ),
             list,
         ):
 
@@ -292,6 +359,7 @@ class MeetingPipeline:
                 item,
                 dict,
             ):
+
                 continue
 
             turn = (
@@ -333,7 +401,10 @@ class MeetingPipeline:
                 dtype=np.float32,
             )
 
-        if source_rate == target_rate:
+        if (
+            source_rate
+            == target_rate
+        ):
 
             return np.ascontiguousarray(
                 waveform,
@@ -403,6 +474,10 @@ class MeetingPipeline:
             dtype=np.float32,
         )
 
+        # ----------------------------------------------------
+        # Stereo -> mono
+        # ----------------------------------------------------
+
         if waveform.ndim > 1:
 
             waveform = np.mean(
@@ -419,6 +494,10 @@ class MeetingPipeline:
         source_rate = int(
             sample_rate
         )
+
+        # ----------------------------------------------------
+        # Resample
+        # ----------------------------------------------------
 
         if (
             source_rate
@@ -522,6 +601,7 @@ class MeetingPipeline:
             return None
 
         if audio.size == 0:
+
             return None
 
         speaker = self._safe_name(
@@ -545,6 +625,7 @@ class MeetingPipeline:
 
         # IMPORTANT:
         # Save only after validation.
+        #
         sf.write(
             str(path),
             audio,
@@ -557,69 +638,194 @@ class MeetingPipeline:
     # ASR
     # ========================================================
 
-    def _transcribe_audio(
+    @staticmethod
+    def _extract_text(
+        result: Any,
+    ) -> str:
+
+        if result is None:
+
+            return ""
+
+        if isinstance(
+            result,
+            dict,
+        ):
+
+            return str(
+                result.get(
+                    "text",
+                    "",
+                )
+                or ""
+            ).strip()
+
+        return str(
+            result
+            or ""
+        ).strip()
+
+    def _transcribe_audio_dual(
         self,
         audio: np.ndarray,
         sample_rate: int,
         start: float,
         end: float,
-    ) -> str:
+    ) -> tuple[
+        dict,
+        dict | None,
+    ]:
 
         duration = (
             end - start
         )
 
         if duration <= 0:
-            return ""
+
+            return (
+                {
+                    "text": ""
+                },
+                None,
+            )
 
         if (
             duration
             < self.grouping.min_group_seconds
         ):
-            return ""
+
+            return (
+                {
+                    "text": ""
+                },
+                None,
+            )
 
         if audio.size == 0:
-            return ""
 
-        try:
+            return (
+                {
+                    "text": ""
+                },
+                None,
+            )
 
-            result = (
-                self.asr_engine.transcribe(
-                    audio,
-                    sample_rate=int(
-                        sample_rate
+        # ====================================================
+        # PRIMARY ASR
+        # ====================================================
+
+        whisper_result = {
+            "text": ""
+        }
+
+        if self.asr_engine is not None:
+
+            try:
+
+                result = (
+                    self.asr_engine.transcribe(
+                        audio,
+                        sample_rate=int(
+                            sample_rate
+                        ),
+                    )
+                )
+
+                if isinstance(
+                    result,
+                    dict,
+                ):
+
+                    whisper_result = (
+                        dict(result)
+                    )
+
+                else:
+
+                    whisper_result = {
+                        "text": str(
+                            result
+                            or ""
+                        ).strip()
+                    }
+
+            except Exception:
+
+                logger.exception(
+                    "Primary ASR failed "
+                    "for %.3f -> %.3f",
+                    start,
+                    end,
+                )
+
+                whisper_result = {
+                    "text": "",
+                    "error": (
+                        "primary_asr_failed"
                     ),
+                }
+
+        # ====================================================
+        # SECONDARY ASR
+        # ====================================================
+
+        shenava_result = None
+
+        if (
+            self.secondary_asr_engine
+            is not None
+        ):
+
+            try:
+
+                result = (
+                    self.secondary_asr_engine
+                    .transcribe(
+                        audio,
+                        sample_rate=int(
+                            sample_rate
+                        ),
+                    )
                 )
-            )
 
-            if isinstance(
-                result,
-                dict,
-            ):
+                if isinstance(
+                    result,
+                    dict,
+                ):
 
-                text = result.get(
-                    "text",
-                    "",
+                    shenava_result = (
+                        dict(result)
+                    )
+
+                else:
+
+                    shenava_result = {
+                        "text": str(
+                            result
+                            or ""
+                        ).strip()
+                    }
+
+            except Exception:
+
+                logger.exception(
+                    "Secondary ASR failed "
+                    "for %.3f -> %.3f",
+                    start,
+                    end,
                 )
 
-            else:
+                shenava_result = {
+                    "text": "",
+                    "error": (
+                        "secondary_asr_failed"
+                    ),
+                }
 
-                text = result
-
-            return str(
-                text or ""
-            ).strip()
-
-        except Exception:
-
-            logger.exception(
-                "ASR failed for "
-                "%.3f -> %.3f",
-                start,
-                end,
-            )
-
-            return ""
+        return (
+            whisper_result,
+            shenava_result,
+        )
 
     def _transcribe_group(
         self,
@@ -627,7 +833,8 @@ class MeetingPipeline:
         waveform: np.ndarray,
         sample_rate: int,
     ) -> tuple[
-        str,
+        dict,
+        dict | None,
         Path | None,
         np.ndarray,
     ]:
@@ -643,11 +850,9 @@ class MeetingPipeline:
         # ----------------------------------------------------
         # Rebuild from source intervals.
         #
-        # We intentionally do NOT simply crop
-        # waveform[start:end].
+        # Do NOT simply crop waveform[start:end].
         #
-        # This prevents ignored short speaker turns from
-        # leaking into the ASR group.
+        # This preserves the existing grouping behavior.
         # ----------------------------------------------------
 
         audio = (
@@ -661,14 +866,16 @@ class MeetingPipeline:
         if audio.size == 0:
 
             return (
-                "",
+                {
+                    "text": ""
+                },
+                None,
                 None,
                 audio,
             )
 
         # ----------------------------------------------------
-        # Debug WAV is written ONLY here, after grouping
-        # validation has already succeeded.
+        # Debug WAV
         # ----------------------------------------------------
 
         debug_path = (
@@ -679,17 +886,23 @@ class MeetingPipeline:
             )
         )
 
-        text = (
-            self._transcribe_audio(
-                audio,
-                sample_rate,
-                start,
-                end,
-            )
+        # ----------------------------------------------------
+        # SAME AUDIO -> TWO ASR ENGINES
+        # ----------------------------------------------------
+
+        (
+            whisper_result,
+            shenava_result,
+        ) = self._transcribe_audio_dual(
+            audio,
+            sample_rate,
+            start,
+            end,
         )
 
         return (
-            text,
+            whisper_result,
+            shenava_result,
             debug_path,
             audio,
         )
@@ -890,11 +1103,7 @@ class MeetingPipeline:
         )
 
         # ----------------------------------------------------
-        # Determine audio source BEFORE validation.
-        #
-        # This is critical:
-        # validation must inspect the actual waveform that
-        # Whisper will receive.
+        # Determine actual waveform source.
         # ----------------------------------------------------
 
         if isolation_enabled:
@@ -920,7 +1129,7 @@ class MeetingPipeline:
             )
 
         # ----------------------------------------------------
-        # Validate each group against its real audio source.
+        # Validate each group against the actual waveform.
         # ----------------------------------------------------
 
         valid_groups = []
@@ -983,19 +1192,7 @@ class MeetingPipeline:
                 )
 
         # ----------------------------------------------------
-        # Re-index ONLY valid groups.
-        #
-        # This eliminates:
-        #
-        # group_036.wav
-        # group_037.wav   <- rejected
-        # group_038.wav
-        #
-        # and gives:
-        #
-        # group_036.wav
-        # group_037.wav
-        # group_038.wav
+        # Re-index valid groups.
         # ----------------------------------------------------
 
         for index, group in enumerate(
@@ -1076,15 +1273,25 @@ class MeetingPipeline:
                 ignored_indices,
             )
 
-            text = ""
+            # ------------------------------------------------
+            # ASR results
+            # ------------------------------------------------
+
+            whisper_result = {
+                "text": ""
+            }
+
+            shenava_result = None
+
             debug_path = None
+
             actual_audio_duration = 0.0
             audio_rms = 0.0
             audio_active_ratio = 0.0
 
-            # ------------------------------------------------
+            # =================================================
             # Speaker isolated mode
-            # ------------------------------------------------
+            # =================================================
 
             if isolation_enabled:
 
@@ -1108,7 +1315,8 @@ class MeetingPipeline:
                 else:
 
                     (
-                        text,
+                        whisper_result,
+                        shenava_result,
                         debug_path,
                         audio,
                     ) = (
@@ -1138,26 +1346,30 @@ class MeetingPipeline:
                             )
                         )
 
-                        audio_active_ratio = float(
-                            np.mean(
-                                np.abs(audio)
-                                > max(
-                                    1e-6,
-                                    float(
-                                        np.max(
-                                            np.abs(
-                                                audio
-                                            )
-                                        )
-                                    )
-                                    * 0.05,
+                        max_amplitude = float(
+                            np.max(
+                                np.abs(
+                                    audio
                                 )
                             )
                         )
 
-            # ------------------------------------------------
+                        threshold = max(
+                            1e-6,
+                            max_amplitude
+                            * 0.05,
+                        )
+
+                        audio_active_ratio = float(
+                            np.mean(
+                                np.abs(audio)
+                                > threshold
+                            )
+                        )
+
+            # =================================================
             # Original audio mode
-            # ------------------------------------------------
+            # =================================================
 
             else:
 
@@ -1174,7 +1386,8 @@ class MeetingPipeline:
                 else:
 
                     (
-                        text,
+                        whisper_result,
+                        shenava_result,
                         debug_path,
                         audio,
                     ) = (
@@ -1204,22 +1417,103 @@ class MeetingPipeline:
                             )
                         )
 
-                        audio_active_ratio = float(
-                            np.mean(
-                                np.abs(audio)
-                                > max(
-                                    1e-6,
-                                    float(
-                                        np.max(
-                                            np.abs(
-                                                audio
-                                            )
-                                        )
-                                    )
-                                    * 0.05,
+                        max_amplitude = float(
+                            np.max(
+                                np.abs(
+                                    audio
                                 )
                             )
                         )
+
+                        threshold = max(
+                            1e-6,
+                            max_amplitude
+                            * 0.05,
+                        )
+
+                        audio_active_ratio = float(
+                            np.mean(
+                                np.abs(audio)
+                                > threshold
+                            )
+                        )
+
+            # ------------------------------------------------
+            # Backward compatibility
+            #
+            # Existing downstream code can continue to read:
+            #
+            #     turn["text"]
+            #
+            # This is currently Whisper's text.
+            # ------------------------------------------------
+
+            whisper_text = (
+                self._extract_text(
+                    whisper_result
+                )
+            )
+
+            shenava_text = (
+                self._extract_text(
+                    shenava_result
+                )
+                if shenava_result is not None
+                else ""
+            )
+
+            # ------------------------------------------------
+            # Log ASR disagreement
+            # ------------------------------------------------
+
+            if (
+                self.secondary_asr_engine
+                is not None
+            ):
+
+                if (
+                    whisper_text
+                    and shenava_text
+                    and whisper_text
+                    != shenava_text
+                ):
+
+                    logger.info(
+                        "ASR disagreement "
+                        "group=%03d | "
+                        "speaker=%s",
+                        group[
+                            "group_index"
+                        ],
+                        speaker,
+                    )
+
+                    logger.info(
+                        "  Whisper : %s",
+                        whisper_text,
+                    )
+
+                    logger.info(
+                        "  Shenava : %s",
+                        shenava_text,
+                    )
+
+                elif (
+                    whisper_text
+                    and shenava_text
+                ):
+
+                    logger.info(
+                        "ASR agreement "
+                        "group=%03d",
+                        group[
+                            "group_index"
+                        ],
+                    )
+
+            # =================================================
+            # Conversation turn
+            # =================================================
 
             conversation_turns.append(
                 {
@@ -1259,7 +1553,39 @@ class MeetingPipeline:
                         5,
                     ),
 
-                    "text": text,
+                    # =================================================
+                    # BACKWARD COMPATIBILITY
+                    # =================================================
+
+                    "text": whisper_text,
+
+                    # =================================================
+                    # DUAL ASR
+                    # =================================================
+
+                    "asr": {
+
+                        "primary_engine": (
+                            "whisper_persian_v4"
+                        ),
+
+                        "secondary_engine": (
+                            "shenava_koochik"
+                            if (
+                                self.secondary_asr_engine
+                                is not None
+                            )
+                            else None
+                        ),
+
+                        "whisper": (
+                            whisper_result
+                        ),
+
+                        "shenava": (
+                            shenava_result
+                        ),
+                    },
 
                     "source_turn_indices": (
                         source_indices
@@ -1391,8 +1717,14 @@ class MeetingPipeline:
                         "duration"
                     ],
 
+                    # Backward-compatible Whisper text
                     "text": item[
                         "text"
+                    ],
+
+                    # New dual ASR output
+                    "asr": item[
+                        "asr"
                     ],
 
                     "source_turn_indices": item[
@@ -1414,10 +1746,14 @@ class MeetingPipeline:
             - file_start
         )
 
+        # ----------------------------------------------------
+        # Transcription mode
+        # ----------------------------------------------------
+
         if isolation_enabled:
 
             transcription_mode = (
-                "speaker_isolated_grouped_asr"
+                "speaker_isolated_grouped_dual_asr"
             )
 
             asr_source = (
@@ -1431,7 +1767,7 @@ class MeetingPipeline:
         else:
 
             transcription_mode = (
-                "diarized_original_audio_grouped_asr"
+                "diarized_original_audio_grouped_dual_asr"
             )
 
             asr_source = (
@@ -1441,6 +1777,10 @@ class MeetingPipeline:
             isolation_strategy = (
                 "disabled_original_audio"
             )
+
+        # ----------------------------------------------------
+        # TSE
+        # ----------------------------------------------------
 
         if tse_enabled:
 
@@ -1462,9 +1802,47 @@ class MeetingPipeline:
                 "none"
             )
 
+        # ====================================================
+        # ASR engine information
+        # ====================================================
+
+        asr_engines = {
+            "primary": (
+                "whisper_persian_v4"
+                if self.asr_engine
+                is not None
+                else None
+            ),
+
+            "secondary": (
+                "shenava_koochik"
+                if self.secondary_asr_engine
+                is not None
+                else None
+            ),
+
+            "dual_asr_enabled": (
+                self.secondary_asr_engine
+                is not None
+            ),
+
+            "reconciliation": {
+                "enabled": False,
+                "engine": None,
+                "status": (
+                    "not_implemented"
+                ),
+            },
+        }
+
+        # ====================================================
+        # Final result
+        # ====================================================
+
         result = {
 
             "project": {
+
                 "name": self.config.get(
                     "project",
                     {},
@@ -1475,7 +1853,9 @@ class MeetingPipeline:
             },
 
             "file": {
+
                 "name": audio_path.name,
+
                 "path": str(
                     audio_path
                 ),
@@ -1524,6 +1904,7 @@ class MeetingPipeline:
                             3,
                         ),
                     }
+
                     for index, turn
                     in enumerate(
                         turns
@@ -1532,6 +1913,10 @@ class MeetingPipeline:
 
                 "speakers": (
                     speaker_transcriptions
+                ),
+
+                "asr_engines": (
+                    asr_engines
                 ),
 
                 "grouping": {
@@ -1718,6 +2103,25 @@ class MeetingPipeline:
                 "asr_grouping": (
                     self.grouping.enabled
                 ),
+
+                "dual_asr_enabled": (
+                    self.secondary_asr_engine
+                    is not None
+                ),
+
+                "asr_primary": (
+                    "whisper_persian_v4"
+                    if self.asr_engine
+                    is not None
+                    else None
+                ),
+
+                "asr_secondary": (
+                    "shenava_koochik"
+                    if self.secondary_asr_engine
+                    is not None
+                    else None
+                ),
             },
         }
 
@@ -1740,48 +2144,142 @@ class MeetingPipeline:
         )
 
         # ====================================================
-        # TXT
+        # TXT - Separate output for each ASR engine
         # ====================================================
 
-        txt_lines = []
+        whisper_txt_lines = []
+        shenava_txt_lines = []
 
         for item in conversation_turns:
 
-            text = str(
+            start = item["start"]
+            end = item["end"]
+            speaker = item["speaker"]
+
+            # ------------------------------------------------
+            # Whisper / Primary ASR
+            # ------------------------------------------------
+
+            whisper_text = str(
                 item.get(
+                    "asr",
+                    {}
+                )
+                .get(
+                    "whisper",
+                    {}
+                )
+                .get(
                     "text",
                     "",
                 )
             ).strip()
 
-            if not text:
-                continue
+            if whisper_text:
 
-            txt_lines.append(
-                "[{} -> {}] {}: {}".format(
-                    item["start"],
-                    item["end"],
-                    item["speaker"],
-                    text,
+                whisper_txt_lines.append(
+                    "[{} -> {}] {}: {}".format(
+                        start,
+                        end,
+                        speaker,
+                        whisper_text,
+                    )
                 )
-            )
 
-        txt_path = (
+            # ------------------------------------------------
+            # Shenava / Secondary ASR
+            # ------------------------------------------------
+
+            shenava_text = str(
+                item.get(
+                    "asr",
+                    {}
+                )
+                .get(
+                    "shenava",
+                    {}
+                )
+                .get(
+                    "text",
+                    "",
+                )
+            ).strip()
+
+            if shenava_text:
+
+                shenava_txt_lines.append(
+                    "[{} -> {}] {}: {}".format(
+                        start,
+                        end,
+                        speaker,
+                        shenava_text,
+                    )
+                )
+
+        # ====================================================
+        # Whisper TXT
+        # ====================================================
+
+        whisper_txt_path = (
             output_dir
-            / f"{audio_path.stem}_meeting.txt"
+            / f"{audio_path.stem}_whisper_persian_v4.txt"
         )
 
-        txt_path.write_text(
+        whisper_txt_path.write_text(
             "\n".join(
-                txt_lines
+                whisper_txt_lines
             )
             + (
                 "\n"
-                if txt_lines
+                if whisper_txt_lines
                 else ""
             ),
             encoding="utf-8",
         )
+
+        # ====================================================
+        # Shenava TXT
+        # ====================================================
+
+        shenava_txt_path = (
+            output_dir
+            / f"{audio_path.stem}_shenava_koochik.txt"
+        )
+
+        shenava_txt_path.write_text(
+            "\n".join(
+                shenava_txt_lines
+            )
+            + (
+                "\n"
+                if shenava_txt_lines
+                else ""
+            ),
+            encoding="utf-8",
+        )
+
+        # ====================================================
+        # Logging
+        # ====================================================
+
+        logger.info(
+            "Meeting JSON: %s",
+            json_path,
+        )
+
+        logger.info(
+            "Whisper TXT : %s",
+            whisper_txt_path,
+        )
+
+        logger.info(
+            "Shenava TXT : %s",
+            shenava_txt_path,
+        )
+        
+        # ====================================================
+        # Logging
+        # ====================================================
 
         logger.info(
             "Meeting JSON: %s",
@@ -1830,18 +2328,58 @@ class MeetingPipeline:
         )
 
         logger.info(
-            "Transcribed groups: %d",
+            "Whisper transcribed groups: %d",
             sum(
                 bool(
                     item.get(
+                        "asr",
+                        {}
+                    )
+                    .get(
+                        "whisper",
+                        {}
+                    )
+                    .get(
                         "text",
                         "",
-                    ).strip()
+                    )
+                    .strip()
                 )
                 for item
                 in conversation_turns
             ),
         )
+
+        if (
+            self.secondary_asr_engine
+            is not None
+        ):
+
+            logger.info(
+                "Shenava transcribed groups: %d",
+                sum(
+                    bool(
+                        item.get(
+                            "asr",
+                            {}
+                        )
+                        .get(
+                            "shenava",
+                            {}
+                        )
+                        and item[
+                            "asr"
+                        ][
+                            "shenava"
+                        ].get(
+                            "text",
+                            "",
+                        ).strip()
+                    )
+                    for item
+                    in conversation_turns
+                ),
+            )
 
         logger.info(
             "Total processing time: %.3f sec",
@@ -1867,7 +2405,45 @@ class MeetingPipeline:
         self.isolation.clear_audio_buffers()
 
         self.diarization.unload()
+
         self.overlap.unload()
+
+        # ----------------------------------------------------
+        # Primary ASR
+        # ----------------------------------------------------
+
+        if self.asr_engine is not None:
+
+            try:
+
+                self.asr_engine.unload()
+
+            except Exception:
+
+                logger.exception(
+                    "Failed to unload "
+                    "primary ASR engine."
+                )
+
+        # ----------------------------------------------------
+        # Secondary ASR
+        # ----------------------------------------------------
+
+        if (
+            self.secondary_asr_engine
+            is not None
+        ):
+
+            try:
+
+                self.secondary_asr_engine.unload()
+
+            except Exception:
+
+                logger.exception(
+                    "Failed to unload "
+                    "secondary ASR engine."
+                )
 
         logger.info(
             "Meeting pipeline unloaded."

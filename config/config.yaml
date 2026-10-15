@@ -260,6 +260,42 @@ asr:
   trim_silence: false
 
 
+  primary:
+    enabled: true
+    engine: whisper_persian_v4
+
+    model:
+      path: models/whisper_persian_v4
+
+    audio:
+      sample_rate: 16000
+      language: fa
+      task: transcribe
+
+    device:
+      type: auto
+      dtype: float16
+
+  secondary:
+    enabled: true
+    engine: shenava_koochik
+
+    model:
+      path: models/shenava-koochik-v1.0/shenava-koochik-v1.0.nemo
+
+    audio:
+      sample_rate: 16000
+
+    device:
+      type: auto
+
+    decoding:
+      decoder: ctc
+      strategy: greedy
+
+    attention_context:
+      - 70
+      - 13
   # ----------------------------------------------------------
   # ASR GROUPING
   # ----------------------------------------------------------
