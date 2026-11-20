@@ -72,8 +72,7 @@ output/debug_audio
 output/.tse_tmp
 
 
-
-
+.env
 
 # ==============================
 # Local input/output data
